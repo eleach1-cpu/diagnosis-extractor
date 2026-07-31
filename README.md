@@ -2,7 +2,7 @@
 
 A small offline Windows tool that reads medical records and lists the diagnosis codes in them.
 
-Point it at a PDF, Word, text or HTML file — or a whole folder — and it writes a plain-text report:
+Point it at a PDF, Word, text, HTML file, or a whole folder and it writes a plain text report:
 
 ```
 file | page/line | code | description | nearest date
@@ -18,7 +18,7 @@ codes** button for the same list.
 
 ## This is not medical or legal advice
 
-The tool reports what it can find. It misses things — scanned pages, handwriting, unusual layouts,
+The tool reports what it can find. It misses things like scanned pages, handwriting, unusual layouts,
 faint print and photographed paper records all defeat it, dates are approximate, and codes can be
 misread or tied to the wrong date. Treat every report as a starting point and confirm each item
 against the source document. Provided as-is, with no warranty. The program will not run until the
@@ -26,7 +26,7 @@ terms have been read and accepted; that acceptance is recorded locally.
 
 ## Privacy
 
-Runs entirely on your computer. No network calls, no telemetry, no cloud OCR — the OCR model runs
+Runs entirely on your computer. No network calls, no telemetry, no cloud OCR. The OCR model runs
 locally. Nothing is sent anywhere.
 
 **No medical records are in this repository, and none should ever be committed to it.** The
@@ -42,7 +42,7 @@ python source/icd_gui.py
 ```
 
 `icd10_data.tsv` (the CDC ICD-10-CM code table) must sit beside the program. It is not in this
-repository — build it from the CDC order file with `source/build_icd_data.py`, as described in
+repository, build it from the CDC order file with `source/build_icd_data.py`, as described in
 `source/HOW_TO_REBUILD.txt`.
 
 The engine also has a command-line entry point in `source/icd_extract.py`, which refuses to run
