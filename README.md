@@ -1,4 +1,5 @@
 # Diagnosis Extractor
+Author: Eric Leach — https://ratemyvso.net
 
 A small offline Windows tool that reads medical records and lists the diagnosis codes in them.
 
