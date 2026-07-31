@@ -1,3 +1,8 @@
+# app/ is the installed program: the built exe, the CDC code table, and the local acceptance
+# record. It is where the tool is RUN from, never something to publish - none of it belongs in
+# git, and reports land there too when a scan is pointed at this folder.
+app/
+
 # Nothing derived from a medical record belongs in this repository.
 # The repo is built from an allowlist, but these patterns are a second line of defence.
 *.pdf
