@@ -1,0 +1,37 @@
+Rebuilding the ICD-10 Extractor from source
+===========================================
+
+Files
+  icd_extract.py    engine + command line
+  icd_gui.py        the window (imports icd_extract)
+  icd_disclaimer.py the terms: consent gate, read-only view, acceptance record
+  icd_theme.py      shared look - palette, fonts, ttk styles, widget helpers
+                    (used by both windows; imported lazily by icd_disclaimer so
+                     the command-line side never pulls in tkinter)
+  build_icd_data.py builds icd10_data.tsv from the CDC order file
+
+  No new packaging step: PyInstaller follows the imports, so icd_theme.py and
+  icd_disclaimer.py are picked up by the same command below.
+
+One-time setup (Python 3.11+):
+  pip install pymupdf python-docx beautifulsoup4 rapidocr-onnxruntime pillow pyinstaller
+
+Refresh the code list (optional, yearly):
+  1. Download the CDC "icd10cm-order-<month>-<year>.txt" file.
+  2. Point SRC in build_icd_data.py at it, run:  python build_icd_data.py
+  3. Copy the resulting icd10_data.tsv next to the .exe files.
+
+Build the GUI exe (windowed, with icon):
+  python -m PyInstaller --onefile --windowed --name icd_extract_gui ^
+    --icon appicon.ico --add-data "appicon.ico;." --add-data "appicon.png;." ^
+    --collect-all rapidocr_onnxruntime --collect-all onnxruntime icd_gui.py
+
+The command-line exe is no longer shipped. icd_extract.py still has its argparse
+entry point, so if you ever want it back:
+  python -m PyInstaller --onefile --console --name icd_extract ^
+    --icon appicon.ico --hidden-import icd_gui ^
+    --add-data "appicon.ico;." --add-data "appicon.png;." ^
+    --collect-all rapidocr_onnxruntime --collect-all onnxruntime icd_extract.py
+
+Ship icd_extract_gui.exe together with icd10_data.tsv, appicon.ico and appicon.png
+in one folder (the .exe reads icd10_data.tsv from beside itself).

@@ -1,0 +1,104 @@
+ICD-10 Diagnosis Extractor  (version 2.0)
+=========================================
+
+NOT MEDICAL ADVICE. NOT LEGAL ADVICE. NO TOOL CATCHES EVERYTHING.
+  The first time you open the window you must read the terms and tick the box
+  before the program will run. Your acceptance is recorded in
+  icd_tool_accepted.txt in this folder. You are asked again after an update.
+  Read the terms any time from  Help > View terms of use.
+  Whatever this tool reports, confirm it against the original record yourself.
+
+WHAT IT DOES
+  Reads PDF, Word (.docx), Text (.txt) and HTML (.htm/.html) files and pulls out
+  every valid ICD-10-CM diagnosis code - and diagnoses named without a code -
+  writing a plain-text report:
+
+     file | page/line | code | description | nearest date
+
+  Diagnoses coded under ICD-9-CM or SNOMED CT are listed too, tagged with that
+  system so they are not mistaken for ICD-10.
+
+  The report ends with a plain list of just the ICD-10 codes, ready to paste
+  into a lookup tool such as  https://ratemyvso.net/dc/icd-codes .
+  ICD-9 and SNOMED codes are deliberately left out of that list - that tool maps
+  ICD-10, and feeding it other systems gives wrong answers. In the window, the
+  "Copy ICD-10 codes" button puts exactly that list on the clipboard.
+
+HOW TO RUN  (Windows)
+  Keep icd_extract_gui.exe and icd10_data.tsv together in the same folder.
+
+  The window:
+     Double-click  icd_extract_gui.exe .
+     Read the terms, tick the box, click Accept (first run only).
+     Click "File..." or "Folder...", tick options if you like (e.g. 'Skip scanned pages' = faster but may miss data), press Extract.
+     The progress bar moves while it works and the status line beside it shows
+     the page it is on. Press Stop to end a long run early - what was found so
+     far is kept, and the report is marked as a partial scan.
+     When it finishes: "Copy ICD-10 codes", "Open report", "Open folder".
+     "Clear" resets the window for the next job. Enter also starts a run.
+     The folder you used last is remembered for next time.
+
+WHAT TO TRUST
+  Code + description : reliable. Every code is checked against the official CDC
+                       ICD-10-CM list, so stray look-alike tokens are dropped. A
+                       bare (no-decimal) code is only kept when its description is
+                       written next to it - so device models, IDs and stray tokens
+                       do not sneak in.
+  CODE "-"           : a diagnosis named in the record with no code at all.
+  [ICD-9-CM]         : coded under ICD-9, not ICD-10. Kept for completeness. Do
+  [SNOMED CT]          not paste these into an ICD-10 lookup tool.
+  Page number        : real for PDF. Word/Text/HTML have no pages, so a line or
+                       paragraph number is shown instead.
+  Date               : APPROXIMATE - the nearest date to the code. With free-form
+                       documents a date cannot be tied to a code with certainty.
+                       Always confirm against the source.
+
+OCR (scanned pages)
+  Scanned/image PDF pages are read with OCR automatically; rows found that way are
+  marked (OCR). OCR can misread characters, so confirm them against the source.
+  On OCR pages only specific codes (with a decimal, e.g. E11.65) are taken - bare
+  codes are dropped, because stray marks too easily spell a valid category. OCR is
+  about 3 seconds per scanned page; a big file can take several minutes (progress
+  prints as it goes). Use --no-ocr to skip it.
+
+NOT DONE
+  No old .doc (only .docx). No doctor/provider name.
+
+UPDATING THE CODE LIST
+  icd10_data.tsv is the CDC ICD-10-CM code set (code <TAB> description). Replace it
+  with a newer year's file in the same format to update.
+
+SCANNING A FOLDER
+  Reports this tool has already written are skipped, so re-running on the same
+  folder does not read its own output back in as if it were a medical record.
+
+PRIVACY
+  Runs entirely on your computer. No internet connection is used. The
+  ratemyvso.net address is printed in the report for you to visit yourself - the
+  tool never sends anything anywhere.
+
+FILES THIS TOOL WRITES BESIDE ITSELF
+  icd_tool_accepted.txt   who accepted the terms, when, and for which version
+  icd_tool_settings.txt   the folder you used last
+  icd_tool_error.log      only if something went wrong (see below)
+  (If this folder is read-only, these go to %LOCALAPPDATA%\ICD_Tool instead.)
+
+IF THE WINDOW MISBEHAVES
+  The window version has no console, so errors cannot print anywhere you would
+  see them. Instead:
+
+  1. An unexpected error pops up a message box and is appended to
+     icd_tool_error.log in this folder. Send that file on.
+
+  2. For a problem with no error at all - nothing appears, or it seems to hang -
+     turn on tracing and run it again:
+
+        set ICD_DEBUG=1
+        icd_extract_gui.exe
+
+     That writes a timestamped icd_tool_debug.log showing how far startup got.
+     Tracing is off unless ICD_DEBUG=1, so it costs nothing the rest of the time.
+
+  Note the first launch after a reboot is slower than later ones: the .exe is a
+  single 168 MB file that unpacks itself to a temporary folder each time it runs.
+  Give it a few seconds before assuming it has died.

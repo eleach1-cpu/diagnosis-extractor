@@ -1,0 +1,41 @@
+# Nothing derived from a medical record belongs in this repository.
+# The repo is built from an allowlist, but these patterns are a second line of defence.
+*.pdf
+*.PDF
+*.docx
+*.doc
+*.htm
+*.html
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.png
+!source/appicon.png
+test_files/
+ocr_files/
+records/
+samples/
+icd10_report*.txt
+
+# Local state written beside the program
+icd_tool_accepted.txt
+icd_tool_settings.txt
+icd_tool_error.log
+icd_tool_debug.log
+*.log
+
+# The CDC code table (7.8 MB, rebuilt from the CDC order file - see source/HOW_TO_REBUILD.txt)
+icd10_data.tsv
+
+# Build output
+build/
+dist/
+*.spec
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
