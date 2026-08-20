@@ -1,8 +1,9 @@
 """
 ICD-10 diagnosis extractor  (v1)
 
-Point it at a file or a folder. It reads PDF, Word (.docx), text (.txt) and
-HTML (.htm/.html), finds every valid ICD-10-CM diagnosis code, and writes a
+Point it at a file or a folder. It reads PDF, Word (.docx), text (.txt),
+HTML (.htm/.html) and structured clinical XML (.xml - CDA/CCD/IHE XDM
+documents), finds every valid ICD-10-CM diagnosis code, and writes a
 plain-text report:  file | page/line | code | description | nearest date.
 
 - Codes are VALIDATED against the official CDC ICD-10-CM code set (icd10_data.tsv
@@ -24,9 +25,15 @@ Usage:
 
 import sys, os, re, argparse, datetime
 
-VERSION = "2.0"
+VERSION = "2.1"
 
-SUPPORTED = (".pdf", ".docx", ".txt", ".htm", ".html")
+SUPPORTED = (".pdf", ".docx", ".txt", ".htm", ".html", ".xml")
+
+# HL7 codeSystem OIDs a CDA/CCD document tags its <code>/<value>/<translation> elements with.
+CDA_ICD10_OID = "2.16.840.1.113883.6.90"
+CDA_ICD9_OID = "2.16.840.1.113883.6.103"
+CDA_SNOMED_OID = "2.16.840.1.113883.6.96"
+CDA_OTHER_SYS = {CDA_ICD9_OID: "ICD-9-CM", CDA_SNOMED_OID: "SNOMED CT"}
 
 # First line of every report this tool writes. It is also how a later run recognises its own
 # output and leaves it out of the scan.
@@ -177,8 +184,9 @@ OTHER_SYS_RE = re.compile(
     r'([A-Z]?\d{2,}(?:\.\d{1,3})?)\b', re.I)
 
 # Trailing status field of a problem-list row - metadata, not part of the diagnosis name.
-ROW_META = re.compile(r'^(?:confirmed|active|inactive|resolved|chronic|acute|principal|primary|'
-                      r'secondary|final|working|suspected|probable|ruled\s*out)\.?$', re.I)
+ROW_META = re.compile(r'^(?:confirmed|(?:no\s*longer\s*)?active|inactive|resolved|chronic|acute|'
+                      r'principal|primary|secondary|final|working|suspected|probable|ruled\s*out|'
+                      r'rank|unranked|low|medium|high|mild|moderate|severe)\.?$', re.I)
 
 
 def _sys_name(raw):
@@ -770,9 +778,96 @@ def read_html(path, codes, results, meta):
     scan_diagnoses(lines, codes, lambda i: f"line {i+1}", results, seen_dx)
 
 
+def _hl7_date(v):
+    """HL7 TS value ("20250714091500-0400", "20250714") to "YYYY-MM-DD". Unparseable -> as-is."""
+    v = (v or "")[:8]
+    if len(v) == 8 and v.isdigit():
+        return f"{v[0:4]}-{v[4:6]}-{v[6:8]}"
+    return v
+
+
+def read_cda(path, codes, results, meta):
+    """A CDA/CCD/IHE-XDM document codes each diagnosis explicitly - <code>, <value> (an
+    observation's coded result) or <translation> (a secondary coding of the same concept)
+    element carries a codeSystem OID, a code and its displayName. There is no free text to
+    search: the structure already says exactly what a diagnosis is, so this reads the tree
+    instead of running the text-based scanners the other formats need.
+    """
+    import xml.etree.ElementTree as ET
+    meta["grain"] = "file"
+    seen = set()
+    seen_dx = set()
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+    parent_map = {child: p for p in root.iter() for child in p}
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    def find_date(el):
+        # The code's date is never on the code element itself - walk up to the enclosing
+        # act/observation/entry and take the first effectiveTime found among its children.
+        node = el
+        while node in parent_map:
+            node = parent_map[node]
+            for child in node:
+                if local(child.tag) == "effectiveTime":
+                    val = child.get("value")
+                    if val:
+                        return _hl7_date(val)
+                    low = next((c for c in child if local(c.tag) == "low"), None)
+                    if low is not None and low.get("value"):
+                        return _hl7_date(low.get("value"))
+        return ""
+
+    idx = 0
+    for el in root.iter():
+        if local(el.tag) not in ("code", "value", "translation"):
+            continue
+        cs = el.get("codeSystem")
+        code_val = el.get("code")
+        if not cs or not code_val:
+            continue
+        disp = (el.get("displayName") or "").strip()
+        idx += 1
+        loc = f"entry {idx}"
+
+        if cs == CDA_ICD10_OID:
+            dotless = code_val.replace(".", "")
+            desc = codes.get(dotless) or disp
+            if not desc:
+                continue
+            key = (loc, dotless)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "loc": loc, "code": code_val, "desc": desc,
+                "date": find_date(el), "ocr": False, "sys": "icd10",
+            })
+        elif cs in CDA_OTHER_SYS:
+            # SNOMED CT also codes a problem's STATUS/severity/likelihood as a <value> next to
+            # its diagnosis ("Active", "Confirmed", "Rank") - same shape as a real diagnosis
+            # code, but not one. ROW_META already lists the status words a Cerner-style row
+            # trims off; reuse it here to drop the same noise.
+            if not disp or ROW_META.match(disp):
+                continue
+            key = (loc, disp.lower())
+            if key in seen_dx:
+                continue
+            seen_dx.add(key)
+            results.append({
+                "loc": loc, "code": code_val,
+                "desc": f"{disp}  [{CDA_OTHER_SYS[cs]}]",
+                "date": find_date(el), "ocr": False, "sys": "other",
+            })
+
+
 READERS = {
     ".pdf": read_pdf, ".docx": read_docx,
     ".txt": read_text, ".htm": read_html, ".html": read_html,
+    ".xml": read_cda,
 }
 
 

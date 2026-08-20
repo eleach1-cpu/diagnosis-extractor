@@ -3,7 +3,7 @@ Author: Eric Leach — https://ratemyvso.net
 
 A small offline Windows tool that reads medical records and lists the diagnosis codes in them.
 
-Point it at a PDF, Word, text, HTML file, or a whole folder and it writes a plain text report:
+Point it at a PDF, Word, text, HTML, or clinical XML (CDA/CCD) file, or a whole folder and it writes a plain text report:
 
 ```
 file | page/line | code | description | nearest date

@@ -184,7 +184,7 @@ def _launch():
     def pick_file():
         p = filedialog.askopenfilename(
             title="Choose a document",
-            filetypes=[("Documents", "*.pdf *.docx *.txt *.htm *.html"), ("All files", "*.*")])
+            filetypes=[("Documents", "*.pdf *.docx *.txt *.htm *.html *.xml"), ("All files", "*.*")])
         if p:
             target_var.set(p)
 
@@ -232,8 +232,8 @@ def _launch():
     ttk.Label(src, text="Document or folder to scan",
               style="CardSection.TLabel").grid(row=0, column=0, columnspan=3, sticky="w",
                                                padx=16, pady=(10, 1))
-    ttk.Label(src, text="One PDF, Word, text or HTML file - or a folder, to read every document "
-                        "inside it.",
+    ttk.Label(src, text="One PDF, Word, text, HTML or XML file - or a folder, to read every "
+                        "document inside it.",
               style="CardHint.TLabel").grid(row=1, column=0, columnspan=3, sticky="w",
                                             padx=16, pady=(0, 7))
     entry = ttk.Entry(src, textvariable=target_var, style="App.TEntry", font=fonts["body"])

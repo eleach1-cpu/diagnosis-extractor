@@ -9,7 +9,8 @@ NOT MEDICAL ADVICE. NOT LEGAL ADVICE. NO TOOL CATCHES EVERYTHING.
   Whatever this tool reports, confirm it against the original record yourself.
 
 WHAT IT DOES
-  Reads PDF, Word (.docx), Text (.txt) and HTML (.htm/.html) files and pulls out
+  Reads PDF, Word (.docx), Text (.txt), HTML (.htm/.html) and clinical XML
+  (.xml - CDA/CCD export) files and pulls out
   every valid ICD-10-CM diagnosis code - and diagnoses named without a code -
   writing a plain-text report:
 
@@ -48,7 +49,7 @@ WHAT TO TRUST
   [ICD-9-CM]         : coded under ICD-9, not ICD-10. Kept for completeness. Do
   [SNOMED CT]          not paste these into an ICD-10 lookup tool.
   Page number        : real for PDF. Word/Text/HTML have no pages, so a line or
-                       paragraph number is shown instead.
+                       paragraph number is shown instead; XML shows an entry number.
   Date               : APPROXIMATE - the nearest date to the code. With free-form
                        documents a date cannot be tied to a code with certainty.
                        Always confirm against the source.
