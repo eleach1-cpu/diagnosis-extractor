@@ -34,7 +34,7 @@ Usage:
 
 import sys, os, re, json, hashlib, argparse, datetime
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 SUPPORTED = (".pdf", ".docx", ".txt", ".htm", ".html", ".xml")
 
