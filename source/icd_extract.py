@@ -140,16 +140,19 @@ def scan_block(text, codes, loc, results, seen, ocr=False):
         # not a diagnosis - drop it.
         if careplan and sub is None:
             continue
-        # From OCR, a bare 3-character category code (no decimal) is the most common false
-        # positive - stray characters on a chart happen to spell a valid category (F20, S31...).
-        # Require a decimal for OCR'd codes; specific codes are almost never fabricated by OCR.
-        if ocr and sub is None:
-            continue
         # A BARE (no-decimal) code is the big source of false positives: device models
         # ("VALLEYLAB / F10 / ..."), IDs, nursing-goal codes, a stray "B12". A real bare
         # diagnosis is written next to its NAME, so require the description to appear nearby.
         # Decimal codes are specific enough to trust on their own (they may sit in a table cell
         # away from their text).
+        #
+        # This is the ONLY bare-code gate, and a scanned page is judged by it on the same terms
+        # as a text one. A blanket "reject every bare code that came from OCR" rule used to sit
+        # above this and short-circuit it. It cost ten rows of L40 (Psoriasis) on a dermatology
+        # record that codes every psoriasis entry bare, and made one whole file report finding
+        # nothing at all. A stray token OCR happens to read as a valid category still has no
+        # diagnosis name beside it, so the check below already rejects it; the ban added no
+        # protection this did not have, and lost real diagnoses.
         if sub is None and not looks_coded_diagnosis(text, m.start(), m.end(), codes[dotless]):
             continue
         # An identifier, not a diagnosis: a code immediately followed by a long run of digits
