@@ -91,6 +91,55 @@ CODE_RE = re.compile(r'\b([A-TV-Z][0-9][0-9AB])(?:\.([0-9A-TV-Z]{1,4}))?\b')
 # The same shape anchored and without the decimal point, for validating a reference file's keys.
 CODE_KEY_RE = re.compile(r'^[A-TV-Z][0-9][0-9AB][0-9A-TV-Z]{0,4}$')
 
+# ---- labeled ICD-9-CM bridge, a second research cross-reference ------------
+# A SECOND optional local reference, built by build_icd9_gem_reference.py from a frozen ICD-9
+# to ICD-10-CM GEM. It sits beside dc_reference.json and is read only when a report already
+# holds a diagnosis the RECORD ITSELF labels ICD-9. It bridges that code to its ICD-10-CM
+# target or targets and then asks the Chunk 2 reference what those map to, so the answer is a
+# research cross-reference two steps removed from the diagnosis and is labeled as such.
+#
+# It can never accept, reject, relabel or change a diagnosis, and a bridged ICD-10-CM target
+# is never substituted for the ICD-9 code in a report row nor added to the paste block: that
+# block feeds an outside ICD-10 lookup, and an ICD-9 code converted behind the veteran's back
+# would be a confident wrong answer somewhere else.
+#
+# Like the DC reference, the whole feature fails open. A missing, unreadable, malformed or
+# wrong-schema file costs the bridge and nothing else.
+GEM_REF_NAME = "icd9_gem_reference.json"
+GEM_MANIFEST_NAME = "icd9_gem_reference.manifest.json"
+GEM_REF_SCHEMA = "icd9-gem-bridge/1"
+
+# The only outcomes this schema defines for a bridged code. Fixed HERE, not read from the
+# artifact, for the same reason as the DC floor: a file must not be able to name an outcome
+# the reader has no rule for and have it printed anyway.
+GEM_DISPOSITIONS = ("ambiguous", "mapped", "unmapped")
+
+# ICD-9-CM, dotless and anchored: three to five digits, or E plus three or four, or V plus two
+# to four. 250.00 -> 25000, E812.0 -> E8120, V18.0 -> V180. Used to validate the artifact's
+# keys and to reject a "bridge" row that is not an ICD-9 code at all.
+GEM_KEY_RE = re.compile(r'^(?:[0-9]{3,5}|E[0-9]{3,4}|V[0-9]{2,4})$')
+
+# The GEM's own vintage is frozen, so a handful of its targets have since been retired from the
+# CDC list. That is recorded in the artifact's ledger and gates nothing; see the builder.
+GEM_REQUIRED_META = {
+    "source": ("name", "sha256", "bytes", "rows"),
+    "code_list": ("name", "sha256", "rows"),
+    "policy": ("floor_percent", "dispositions", "vote_basis"),
+    "counts": ("source_rows", "bridge_rows", "multi_target_rows", "target_slots",
+               "distinct_targets", "targets_outside_code_list", "rows_with_no_current_target"),
+}
+
+# How wide the bridge-target column is, and therefore how many targets a row prints before it
+# stops listing and says how many more there are. One ICD-9 aftercare code can bridge to over
+# five hundred ICD-10 targets, and a row that wraps for a page is not more honest than a row
+# that says so.
+#
+# A WIDTH rather than a count, because a count cannot keep the table aligned: four targets are
+# twelve characters wide as "C47.8, C49.8" and forty as "E11.9, Z79.899, Z83.3, V49.88XA", and
+# the second overruns the column and jams the diagnostic code onto the end of the target list
+# where a reader cannot tell which is which.
+GEM_TARGETS_WIDTH = 18
+
 # ---- date shapes (approximate binding) -------------------------------------
 DATE_RES = [
     re.compile(r'\b(\d{1,2}/\d{1,2}/\d{2,4})\b'),
@@ -304,15 +353,209 @@ def dc_for_code(ref, code):
     return "unmapped", "", "", ""
 
 
-def dc_section(codes_found, ref, ref_missing_reason=""):
+def _gem_bridge_ok(bridge):
+    """Every row of the bridge section: an ICD-9 key mapping to distinct ICD-10 targets.
+
+    Checked in full before any of it is used. A row like `{"25000": "E119"}` would otherwise
+    iterate as the characters of a string and vote five times for nothing; a row like
+    `{"25000": ["M2041"]}` would print Hammer toe beside a diabetes diagnosis. The first is a
+    crash, the second is a wrong answer, and only the second is worth being careful about.
+    """
+    for code, targets in bridge.items():
+        if not isinstance(code, str) or not GEM_KEY_RE.match(code):
+            return False
+        # A str is iterable and a bool is an int; neither is a list of targets.
+        if isinstance(targets, (str, bytes)) or not isinstance(targets, list) or not targets:
+            return False
+        seen = set()
+        for t in targets:
+            if not isinstance(t, str) or not CODE_KEY_RE.match(t) or t in seen:
+                return False
+            seen.add(t)
+    return True
+
+
+def _gem_manifest_agrees(base_dir, digest):
+    """The detached manifest must vouch for exactly this filename and these bytes."""
+    try:
+        with open(os.path.join(base_dir, GEM_MANIFEST_NAME), "rb") as f:
+            man = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(man, dict):
+        return False
+    art = man.get("artifact")
+    if not isinstance(art, dict):
+        return False
+    return art.get("name") == GEM_REF_NAME and art.get("sha256") == digest
+
+
+def load_gem_reference(base_dir):
+    """The optional labeled-ICD-9 bridge from beside the program, or None.
+
+    NEVER RAISES, and never returns half-trusted data. Anything wrong answers None, which the
+    report renders as "unavailable": missing file, unreadable, not JSON, wrong schema, absent
+    or malformed metadata, a corrupted row, a count that disagrees with what it counts, a
+    disposition vocabulary this reader has no rule for, a missing manifest, or bytes the
+    manifest does not vouch for.
+
+    The artifact's `dc_audit` block is a BUILD RECEIPT and is validated for shape but never
+    used as an answer. Every diagnostic code printed for a bridged ICD-9 row is looked up live
+    in the DC reference installed beside the program, so a rebuilt DC reference changes the
+    answers without this file having to be rebuilt, and a DC reference that is missing or
+    refused cannot be papered over by a stale summary recorded here.
+    """
+    path = os.path.join(base_dir, GEM_REF_NAME)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        digest = hashlib.sha256(raw).hexdigest()
+        gem = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(gem, dict) or gem.get("schema") != GEM_REF_SCHEMA:
+        return None
+    if not isinstance(gem.get("generated"), str) or not gem["generated"].strip():
+        return None
+    for block, fields in GEM_REQUIRED_META.items():
+        meta = gem.get(block)
+        if not isinstance(meta, dict) or any(meta.get(f) in (None, "") for f in fields):
+            return None
+    # The file must agree with the agreement bar and the outcome vocabulary this reader
+    # enforces. A file declaring some other policy is not one this schema version knows how to
+    # read, and trusting its numbers would let it move the line that judges its own contents.
+    if gem["policy"].get("floor_percent") != DC_FLOOR_PERCENT:
+        return None
+    if gem["policy"].get("dispositions") != list(GEM_DISPOSITIONS):
+        return None
+    if not isinstance(gem.get("bridge"), dict) or not gem["bridge"]:
+        return None
+    if not isinstance(gem.get("ledger"), dict):
+        return None
+    if not _gem_bridge_ok(gem["bridge"]):
+        return None
+
+    # A count that disagrees with what it counts means the file was cut short or edited, even
+    # when every surviving row is individually well formed. source_rows must equal bridge_rows
+    # because nothing is quarantined: every source row bridges, so a shortfall is a loss.
+    bridge = gem["bridge"]
+    counts = gem["counts"]
+    if counts.get("bridge_rows") != len(bridge) or counts.get("source_rows") != len(bridge):
+        return None
+    if counts.get("multi_target_rows") != sum(1 for t in bridge.values() if len(t) > 1):
+        return None
+    if counts.get("target_slots") != sum(len(t) for t in bridge.values()):
+        return None
+    if counts.get("distinct_targets") != len({t for ts in bridge.values() for t in ts}):
+        return None
+    if gem["source"].get("rows") != len(bridge):
+        return None
+
+    # The build receipt: shape only, and it must account for every bridged row under exactly
+    # the outcomes this reader knows. A receipt naming an outcome with no rule behind it means
+    # the file was built by something this reader does not understand.
+    audit = gem.get("dc_audit")
+    if not isinstance(audit, dict) or not isinstance(audit.get("reference"), dict):
+        return None
+    ref_meta = audit["reference"]
+    if any(ref_meta.get(f) in (None, "") for f in ("name", "sha256")):
+        return None
+    tally = audit.get("counts")
+    if not isinstance(tally, dict) or sorted(tally) != sorted(GEM_DISPOSITIONS):
+        return None
+    for value in tally.values():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    if sum(tally.values()) != len(bridge):
+        return None
+
+    if not _gem_manifest_agrees(base_dir, digest):
+        return None
+    return gem
+
+
+def gem_bridge(gem, ref, code):
+    """Bridge one code the record LABELS ICD-9-CM to a potential diagnostic code.
+
+    Returns (state, targets, dc, name, basis). `targets` is every ICD-10-CM target the GEM
+    gives, dotted for display and never collapsed, so the reader can see what was crossed
+    rather than only what it produced. State is one of:
+      mapped       the targets that map agree on a DC at or above the floor
+      ambiguous    the targets that map do not agree enough to answer
+      unmapped     the GEM is fine; this code is absent from it, or bridges only to targets
+                   the DC reference has no row for
+      unavailable  no usable bridge or DC reference
+
+    The 60% floor is applied as exact integer arithmetic over the MAPPED targets only. A
+    target the DC reference does not map casts no vote, so a code bridging to one mapped and
+    nine unmapped targets answers 1 of 1 rather than 1 of 10: the nine are silent, not
+    dissenting, and counting silence as dissent would refuse an answer that is not in doubt.
+    """
+    if gem is None or ref is None:
+        return "unavailable", [], "", "", "bridge reference unavailable"
+    dotless = re.sub(r'[^0-9A-Za-z]', '', code).upper()
+    targets = gem["bridge"].get(dotless)
+    if not targets:
+        return "unmapped", [], "", "", "not in the ICD-9 to ICD-10-CM GEM"
+
+    shown = [dotted(t[:3], t[3:]) for t in targets]
+    tally, order = {}, []
+    for target in targets:
+        state, dc, _name, _basis = dc_for_code(ref, target)
+        if state != "mapped":
+            continue
+        if dc not in tally:
+            order.append(dc)
+        tally[dc] = tally.get(dc, 0) + 1
+    if not tally:
+        return "unmapped", shown, "", "", "no diagnostic code for the bridge target(s)"
+
+    total = sum(tally.values())
+    # Ties break to the lower DC number, matching the builder, so the two never disagree.
+    dc, votes = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+    pct = round(100.0 * votes / total)
+    if votes * 100 >= DC_FLOOR_PERCENT * total:
+        return "mapped", shown, dc, ref["dc_names"].get(dc, ""), \
+            f"bridged, {votes} of {total} agree ({pct}%)"
+    return "ambiguous", shown, "", "", \
+        f"bridge split, top {dc} with {votes} of {total} ({pct}%)"
+
+
+def _gem_targets_text(targets, width=GEM_TARGETS_WIDTH):
+    """The bridge targets for one row: as many whole ones as fit, then how many were left out.
+
+    Never truncates a code itself - a half-printed ICD-10 code is worse than an honest count of
+    the ones not shown. A single target wider than the column is printed anyway, because a row
+    that lists nothing at all says less than a row that runs slightly long.
+    """
+    if not targets:
+        return "-"
+    shown = []
+    for target in targets:
+        left = len(targets) - len(shown) - 1
+        trial = ", ".join(shown + [target]) + (f" +{left} more" if left else "")
+        if shown and len(trial) > width:
+            break
+        shown.append(target)
+    left = len(targets) - len(shown)
+    return ", ".join(shown) + (f" +{left} more" if left else "")
+
+
+def dc_section(codes_found, ref, ref_missing_reason="", icd9_found=(), gem=None,
+               gem_missing_reason=""):
     """The report's cross-reference block, as a list of lines.
 
     codes_found is the distinct ICD-10 codes the report holds, in the order they should print.
-    ICD-9 and SNOMED rows are deliberately NOT looked up here: this reference maps ICD-10-CM
-    only, and answering for another code system would be a guess wearing a confident face.
+    icd9_found is the distinct codes the RECORD ITSELF labeled ICD-9-CM, which are bridged
+    through the GEM to ICD-10-CM and only then looked up here.
+
+    SNOMED rows are deliberately NOT looked up at all: no local mapping from SNOMED ships with
+    this program, and answering for a code system it cannot read would be a guess wearing a
+    confident face.
     """
     out = ["", DC_HEADING, "-" * 78]
-    if not codes_found:
+    if not codes_found and not icd9_found:
         out.append("No ICD-10 codes were found above, so there is nothing to look up.")
         return out
     out.append("A LOCAL RESEARCH AID ONLY. This is not an official VA crosswalk, not a rating,")
@@ -327,16 +570,50 @@ def dc_section(codes_found, ref, ref_missing_reason=""):
         if ref_missing_reason:
             out.append(f"Reason:{ref_missing_reason}")
         return out
-    out.append(f"   {'ICD-10':<12} {'DC':<6} {'BASIS':<34} VA DIAGNOSTIC CODE")
+    if codes_found:
+        out.append(f"   {'ICD-10':<12} {'DC':<6} {'BASIS':<34} VA DIAGNOSTIC CODE")
+        out.append("   " + "-" * 75)
+        for code in codes_found:
+            state, dc, name, basis = dc_for_code(ref, code)
+            if state == "mapped":
+                out.append(f"   {code:<12} {dc:<6} {basis:<34} {name}")
+            elif state == "ambiguous":
+                out.append(f"   {code:<12} {'-':<6} {basis}")
+            else:
+                out.append(f"   {code:<12} {'-':<6} no mapping in this reference")
+    if icd9_found:
+        out.extend(_icd9_bridge_lines(icd9_found, ref, gem, gem_missing_reason))
+    return out
+
+
+def _icd9_bridge_lines(icd9_found, ref, gem, gem_missing_reason=""):
+    """The labeled-ICD-9-CM half of the cross-reference block.
+
+    Two steps are shown rather than one, because two steps were taken. The ICD-9 code stays
+    exactly as the record wrote it, the ICD-10-CM target it was crossed to is printed beside
+    it, and the diagnostic code - when there is one - is reached through that target. A reader
+    who disagrees with the bridge can see the bridge.
+    """
+    out = ["",
+           "   Codes the record labels ICD-9-CM, bridged through a frozen ICD-9 to ICD-10-CM",
+           "   GEM and then looked up above. The GEM is a conversion table, not a VA document,",
+           "   and the ICD-9 code in the diagnosis rows above is unchanged."]
+    if gem is None:
+        out.append("   Bridge data unavailable, so these codes could not be crossed. EVERY")
+        out.append("   DIAGNOSIS ABOVE IS UNAFFECTED.")
+        if gem_missing_reason:
+            out.append(f"   Reason:{gem_missing_reason}")
+        return out
+    out.append(f"   {'ICD-9-CM':<10} {'ICD-10-CM':<18} {'DC':<6} {'BASIS':<30} "
+               f"VA DIAGNOSTIC CODE")
     out.append("   " + "-" * 75)
-    for code in codes_found:
-        state, dc, name, basis = dc_for_code(ref, code)
+    for code in icd9_found:
+        state, targets, dc, name, basis = gem_bridge(gem, ref, code)
+        shown = _gem_targets_text(targets)
         if state == "mapped":
-            out.append(f"   {code:<12} {dc:<6} {basis:<34} {name}")
-        elif state == "ambiguous":
-            out.append(f"   {code:<12} {'-':<6} {basis}")
+            out.append(f"   {code:<10} {shown:<18} {dc:<6} {basis:<30} {name}")
         else:
-            out.append(f"   {code:<12} {'-':<6} no mapping in this reference")
+            out.append(f"   {code:<10} {shown:<18} {'-':<6} {basis}")
     return out
 
 
@@ -500,13 +777,19 @@ def scan_other_codes(lines, loc_for, results, seen, ocr=False):
             if key in seen:
                 continue
             seen.add(key)
+            system = _sys_name(m.group(1))
             results.append({
                 "loc": loc,
                 "code": m.group(2),
-                "desc": f"{name}  [{_sys_name(m.group(1))}]",
+                "desc": f"{name}  [{system}]",
                 "date": "",
                 "ocr": ocr,
                 "sys": "other",
+                # The code system as its own field, not parsed back out of desc later. desc is
+                # display text and picks up a "(x3)" count in --unique mode; deciding whether a
+                # row may be bridged by re-reading display text is how a repeat diagnosis
+                # quietly stops being an ICD-9 row.
+                "csys": system,
             })
 
 
@@ -1137,6 +1420,7 @@ def read_cda(path, codes, results, meta):
                 "loc": loc, "code": code_val,
                 "desc": f"{disp}  [{CDA_OTHER_SYS[cs]}]",
                 "date": find_date(el), "ocr": False, "sys": "other",
+                "csys": CDA_OTHER_SYS[cs],
             })
 
 
@@ -1236,6 +1520,10 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     total = 0
     stopped = False
     icd10_codes = []                               # every distinct ICD-10 code, for the paste block
+    # Every distinct code the RECORD ITSELF labeled ICD-9-CM, for the bridge. Kept apart from
+    # icd10_codes on purpose: these must never reach the paste block, which feeds an outside
+    # ICD-10 lookup that would answer for them confidently and wrongly.
+    icd9_codes = []
     lines = []
     lines.append(REPORT_BANNER)
     lines.append(f"Scanned: {target}")
@@ -1326,6 +1614,10 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
             total += 1
             if r.get("sys") == "icd10" and r["code"] not in icd10_codes:
                 icd10_codes.append(r["code"])
+            # Only a row the record labeled ICD-9 may be bridged. SNOMED rows carry the same
+            # "other" system marker and are deliberately left out: nothing local maps them.
+            elif str(r.get("csys", "")).startswith("ICD-9") and r["code"] not in icd9_codes:
+                icd9_codes.append(r["code"])
 
     lines.append("")
     lines.append("=" * 78)
@@ -1340,10 +1632,14 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     # The cross-reference sits ABOVE the paste block, never below it: codes_from_report() reads
     # from the CODES_HEADING line to the end of the file, so anything added underneath would be
     # handed to whoever pressed Copy as if it were an ICD-10 code.
-    ref = load_dc_reference(base) if icd10_codes else None
+    ref = load_dc_reference(base) if (icd10_codes or icd9_codes) else None
+    gem = load_gem_reference(base) if icd9_codes else None
     lines.extend(dc_section(sorted(icd10_codes), ref,
                             f" ({DC_REF_NAME} is missing, damaged, or not vouched for by "
-                            f"{DC_MANIFEST_NAME})"))
+                            f"{DC_MANIFEST_NAME})",
+                            icd9_found=sorted(icd9_codes), gem=gem,
+                            gem_missing_reason=f" ({GEM_REF_NAME} is missing, damaged, or not "
+                                               f"vouched for by {GEM_MANIFEST_NAME})"))
 
     # The bare code list goes LAST so it is easy to select, and so codes_from_report can simply
     # read to the end of the file.

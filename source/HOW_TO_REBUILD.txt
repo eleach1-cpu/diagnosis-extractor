@@ -12,10 +12,17 @@ Files
   build_dc_reference.py
                     builds dc_reference.json, the optional Potential-VA-
                     Diagnostic-Code research cross-reference (see below)
+  build_icd9_gem_reference.py
+                    builds icd9_gem_reference.json, the optional bridge from the
+                    ICD-9-CM codes a record LABELS as such through to that same
+                    cross-reference (see below)
 
   No new packaging step: PyInstaller follows the imports, so icd_theme.py and
-  icd_disclaimer.py are picked up by the same command below. build_dc_reference.py
-  is a build-time tool and is NOT imported by the program, so it is not bundled.
+  icd_disclaimer.py are picked up by the same command below. Both build_ scripts
+  are build-time tools and are NOT imported by the program, so neither is bundled.
+  build_icd9_gem_reference.py does import icd_extract, but only to borrow the
+  reader's own floor, code shapes and lookup, so the artifact it writes cannot
+  drift from the rules the program will apply to it.
 
 One-time setup (Python 3.11+):
   pip install pymupdf python-docx beautifulsoup4 rapidocr-onnxruntime pillow pyinstaller
@@ -77,6 +84,59 @@ Rebuild the Potential-DC reference (optional, only when the crosswalk changes):
   non-numeric diagnostic code, a colliding normalized key or a ledger imbalance.
   It never fetches, scrapes, infers or repairs a clinical mapping.
 
+Rebuild the labeled-ICD-9-CM bridge (optional, only when the GEM changes):
+
+  Build the Potential-DC reference FIRST. The bridge is built against it and
+  refuses to build without a usable one.
+
+  python build_icd9_gem_reference.py --gem <path to icd9-to-icd10-gem.json> ^
+    --codes ..\app\icd10_data.tsv --dc-reference <folder> --out <folder>
+
+  or point at a repository root instead of the file:
+
+  python build_icd9_gem_reference.py --ratemyvso <path to the checkout> ^
+    --codes ..\app\icd10_data.tsv --dc-reference <folder> --out <folder>
+
+  There is no default path. --dc-reference is the FOLDER holding dc_reference.json
+  and dc_reference.manifest.json; the builder reads it through the program's own
+  loader, so a DC reference the program would refuse stops the build instead of
+  being summarised as though it were sound.
+
+  It writes two files:
+    icd9_gem_reference.json           the data the program reads
+    icd9_gem_reference.manifest.json  the detached build record
+
+  A GEM is a General Equivalence Mapping: a frozen ICD-9-CM to ICD-10-CM
+  conversion table. It is not a VA document and the result is a research
+  cross-reference, never a rating or an entitlement decision.
+
+  Checking a build:
+    - artifact SHA-256 matches icd9_gem_reference.manifest.json
+    - source SHA-256 matches the GEM you built from
+    - counts.bridge_rows == counts.source_rows
+      (EVERY source row bridges; there is no quarantine, so a shortfall is a loss)
+    - counts.multi_target_rows, target_slots and distinct_targets all recompute
+      from the bridge section itself
+    - dc_audit.counts sums to the bridge row count under exactly the three
+      outcomes mapped / ambiguous / unmapped
+    - dc_audit.reference.sha256 names the DC reference it was audited against
+    - ledger.targets_outside_code_list and rows_with_no_current_target record the
+      GEM's frozen vintage: targets the current CDC list no longer carries. They
+      gate nothing. A retired target is still the correct historical bridge, and
+      the DC reference remains the only authority on what maps.
+
+  dc_audit is a BUILD RECEIPT, not an answer. The program votes live against
+  whichever DC reference is installed beside it, so rebuilding the DC reference
+  changes the answers without this file needing a rebuild.
+
+  --generated is an input, not a clock read, so two builds of the same inputs
+  produce byte-identical artifacts. Only the manifest carries a wall-clock time.
+
+  The builder fails loudly on a key that is not an ICD-9 shape, a target that is
+  not an ICD-10 shape, a bare string or empty list where targets belong, a
+  repeated target, a colliding normalized key or a row-count imbalance. It never
+  fetches, scrapes, infers or repairs a clinical mapping.
+
 Ship icd_extract_gui.exe together with icd10_data.tsv, appicon.ico and appicon.png
 in one folder (the .exe reads icd10_data.tsv from beside itself).
 
@@ -97,3 +157,24 @@ changes either way, and the final ICD-10 CODES block is unaffected.
   veteran's diagnosis. Every row is also shape-checked on load, and the stored
   counts must match the sections they count, so truncation is caught even when the
   surviving rows are individually fine.
+
+If icd9_gem_reference.json is put in that folder TOO, that section gains a second
+block bridging the ICD-9-CM codes the record labels as such. The same rule applies
+twice over:
+
+  SHIP ALL FOUR FILES, OR THE DC PAIR ALONE, OR NEITHER PAIR. The bridge needs the
+  DC reference to have anything to look its targets up in; ship the bridge without
+  it and the whole section reports itself unavailable rather than presenting a
+  missing diagnostic code as a fact about the ICD-9 code. Ship the bridge artifact
+  without its own manifest and the bridge block alone reports unavailable, by
+  design, exactly as the DC pair does.
+
+  Only codes the record LABELS ICD-9 or ICD-9-CM, or a CDA element carrying the
+  ICD-9-CM OID, are ever bridged. No new detection was added and no bare number is
+  read as an ICD-9 code. SNOMED CT rows are reported but never bridged: no local
+  SNOMED mapping ships with this program.
+
+  A bridged ICD-10-CM target never replaces the ICD-9 code in a diagnosis row and
+  never enters the final ICD-10 CODES block. That block is pasted into an outside
+  ICD-10 lookup, which would answer for a silently converted code confidently and
+  wrongly.
