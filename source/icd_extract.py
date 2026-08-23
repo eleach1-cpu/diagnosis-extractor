@@ -1,5 +1,5 @@
 """
-ICD-10 diagnosis extractor  (v1)
+ICD-10 diagnosis extractor
 
 Point it at a file or a folder. It reads PDF, Word (.docx), text (.txt),
 HTML (.htm/.html) and structured clinical XML (.xml - CDA/CCD/IHE XDM
@@ -12,12 +12,21 @@ plain-text report:  file | page/line | code | description | nearest date.
   so it does not depend on the document's layout.
 - Diagnoses coded under ANOTHER system (ICD-9-CM, SNOMED CT) are reported too, tagged
   with that system, so a problem list that predates ICD-10 is not silently dropped.
+- SCANNED/IMAGE pages are read by local OCR (RapidOCR, on this machine only); rows
+  found that way are tagged (OCR) because character recognition can misread. --no-ocr
+  skips them for speed.
 - Page numbers are real for PDF. Word/Text/HTML have no pages, so a line (or
   paragraph) number is given instead.
 - The date is the nearest one found near the code and is APPROXIMATE - with
-  free-form documents there is no reliable way to bind a date to a code.
+  free-form documents there is no reliable way to bind a date to a code. A date
+  labeled as the patient's date of birth is never used, and a letterhead date
+  repeated in a page's banner yields to a date from the body of the page.
+- Two OPTIONAL local reference files add a Potential-VA-Diagnostic-Code research
+  section (dc_reference.json + manifest) and an ICD-9-CM bridge into it
+  (icd9_gem_reference.json + manifest). Both fail open: missing or damaged files
+  cost the extra section and nothing else.
 
-No network. No OCR (scanned/image-only PDFs yield no text). No old .doc.
+No network, ever. No old .doc.
 
 Usage:
     icd_extract  <file-or-folder>  [-o report.txt]
@@ -146,6 +155,101 @@ DATE_RES = [
     re.compile(r'\b(\d{4}-\d{2}-\d{2})\b'),
     re.compile(r'\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\b', re.I),
 ]
+
+# A date-of-birth LABEL sitting immediately before a date. The label, not the date's age,
+# is what disqualifies it: a 1972 date is a perfectly good visit date on a Vietnam-era record,
+# and nothing here may reject a date merely for being old.
+#
+# [o0] because OCR routinely reads the O of DOB as a zero: the real records this was built
+# against print "D0B: 03/19/1969" and "DO.B.:" in their banners. Anchored to the END of the
+# window before the date so "Dobson 3/19/2020" (a name, not a label) cannot match.
+DOB_LABEL_RE = re.compile(
+    r'(?:\bd\.?\s?[o0]\.?\s?b\.?|\bdate\s+of\s+birth|\bbirth\s*date|\bborn)'
+    r'\s*[:;.,-]?\s*$', re.I)
+
+# How much of a block counts as its header/banner when classifying dates: the first
+# HEADER_LINES lines, but never more than half the block, so a short page is not all header.
+# Real pages put the patient banner (name, DOB, date of service) in the electronic text layer
+# plus the OCR of the printed letterhead, which together land inside the first ten lines.
+HEADER_LINES = 10
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+
+def _date_value(s):
+    """(year, month, day) for any DATE_RES shape, or None. Used to recognise ONE date written
+    two ways ("3/19/1969", "03/19/69"), never to judge or reject the date itself."""
+    s = s.strip()
+    m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', s)
+    if m:
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000 if y < 50 else 1900
+        return (y, mo, d)
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.match(r'^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$', s)
+    if m and m.group(1)[:3].lower() in MONTHS:
+        return (int(m.group(3)), MONTHS[m.group(1)[:3].lower()], int(m.group(2)))
+    return None
+
+
+def date_candidates(text):
+    """The block's dates split into (body, header) candidate lists, DOB removed from both.
+
+    Two rules, and only these two:
+
+    DATE OF BIRTH is never a diagnosis date. A date is dropped when a DOB label sits right
+    before it, and any other date on the block carrying the SAME value is dropped too - the
+    banner writes the birth date three times and labels it once, and an unlabeled copy of a
+    labeled birth date is still the birth date.
+
+    A REPEATED BANNER DATE yields to a body date. A value that appears more than once on the
+    block with at least one copy in the header zone is the letterhead's date, printed by the
+    template rather than beside any diagnosis. Those are kept - on a page whose only date is
+    the encounter date in its banner, that date is the right answer - but a body date in the
+    same at-or-before position wins over it. The at-or-before rule itself is UNCHANGED and
+    still comes first: a banner date above the diagnosis still beats a body date below it,
+    because the one date most pages carry BELOW every diagnosis is the fax or print stamp in
+    the footer, and preferring that over the encounter date would replace a right answer with
+    a wrong one. Measured on the real records this was built against, exactly that swap is
+    what an unconditional prefer-the-body rule produced. No date is ever invented.
+    """
+    found = all_dates(text)
+    if not found:
+        return [], []
+
+    dob_values = set()
+    kept = []
+    for pos, ds in found:
+        if DOB_LABEL_RE.search(text[max(0, pos - 24):pos]):
+            val = _date_value(ds)
+            if val:
+                dob_values.add(val)
+            continue
+        kept.append((pos, ds))
+    if dob_values:
+        kept = [(pos, ds) for pos, ds in kept if _date_value(ds) not in dob_values]
+    if not kept:
+        return [], []
+
+    lines = text.splitlines()
+    zone_lines = min(HEADER_LINES, max(1, len(lines) // 2))
+    zone_end = sum(len(ln) + 1 for ln in lines[:zone_lines])
+
+    counts, in_zone = {}, set()
+    for pos, ds in kept:
+        val = _date_value(ds) or ds
+        counts[val] = counts.get(val, 0) + 1
+        if pos < zone_end:
+            in_zone.add(val)
+    banner = {v for v, n in counts.items() if n >= 2 and v in in_zone}
+
+    body = [(pos, ds) for pos, ds in kept if (_date_value(ds) or ds) not in banner]
+    header = [(pos, ds) for pos, ds in kept if (_date_value(ds) or ds) in banner]
+    return body, header
 
 
 def load_codes(base_dir):
@@ -341,15 +445,20 @@ def dc_for_code(ref, code):
     row = ref["derived"].get(dotless)
     if row:
         dc, votes, total = row[0], row[1], row[2]
-        pct = round(100.0 * votes / total) if total else 0
-        return "mapped", dc, ref["dc_names"].get(dc, ""), \
-            f"category, {votes} of {total} agree ({pct}%)"
-    row = ref["ambiguous"].get(dotless)
-    if row:
-        dc, votes, total = row[0], row[1], row[2]
-        pct = round(100.0 * votes / total) if total else 0
-        return "ambiguous", "", "", \
-            f"category vote split, top {dc} with {votes} of {total} ({pct}%)"
+        # Owner rule, 2026-08-23: a category answer is labeled for what it IS - a match at the
+        # category level - without vote arithmetic in the reader's face. Unanimous says just
+        # that; a majority carries its percentage; the numerator, denominator and audit trail
+        # all stay in the artifact, which this wording change does not touch. Never relabeled
+        # as direct: 100% agreement among children is still a category-level answer.
+        if votes == total:
+            basis = "Category match only"
+        else:
+            basis = f"Category match only - {round(100.0 * votes / total)}% confidence"
+        return "mapped", dc, ref["dc_names"].get(dc, ""), basis
+    if dotless in ref["ambiguous"]:
+        # Below the floor the children disagree too much to answer. The vote lives in the
+        # artifact for audit; the reader sees a refusal, not arithmetic to second-guess.
+        return "ambiguous", "", "", "No reliable category match"
     return "unmapped", "", "", ""
 
 
@@ -542,6 +651,24 @@ def _gem_targets_text(targets, width=GEM_TARGETS_WIDTH):
     return ", ".join(shown) + (f" +{left} more" if left else "")
 
 
+def consolidate_codes(codes):
+    """Final-result consolidation: drop a bare 3-character parent when a more specific child
+    from the same category was extracted anywhere in the SAME RUN.
+
+    Owner rule, 2026-08-23. "L40" beside an extracted "L40.0" adds nothing to a final list and
+    reads as a second condition; the specific child is the better record of the same finding.
+    Runs over the whole selected run, not per page or per file. Children never suppress each
+    other (L40.0 and L40.50 both stay), a parent with no extracted child stays, and only codes
+    actually EXTRACTED from the records participate - an ICD-9 bridge target is a conversion,
+    not a finding, and never suppresses anything.
+
+    Detailed page rows are untouched: what appeared on each page stays reported there.
+    """
+    norm = {c: re.sub(r'[^0-9A-Za-z]', '', c).upper() for c in codes}
+    parented = {n[:3] for n in norm.values() if len(n) > 3}
+    return [c for c in codes if not (len(norm[c]) == 3 and norm[c] in parented)]
+
+
 def dc_section(codes_found, ref, ref_missing_reason="", icd9_found=(), gem=None,
                gem_missing_reason=""):
     """The report's cross-reference block, as a list of lines.
@@ -636,6 +763,26 @@ def nearest_date(dates, pos):
     return min(dates, key=lambda x: abs(x[0] - pos))[1]
 
 
+def pick_date(body, header, pos):
+    """One date for a code at pos, from the body/header candidate split.
+
+    The order is the old at-or-before rule with one refinement inside each half:
+        1. nearest BODY date at or before the code
+        2. nearest HEADER date at or before it     (the banner still beats anything below)
+        3. nearest BODY date after it
+        4. nearest HEADER date after it
+    "" when there are no candidates at all - an empty date is honest, an invented one is not.
+    """
+    for pool, want_before in ((body, True), (header, True), (body, False), (header, False)):
+        if want_before:
+            side = [(pos - p, d) for p, d in pool if p <= pos]
+        else:
+            side = [(p - pos, d) for p, d in pool if p > pos]
+        if side:
+            return min(side, key=lambda x: x[0])[1]
+    return ""
+
+
 def dotted(cat, sub):
     return f"{cat}.{sub}" if sub else cat
 
@@ -678,7 +825,7 @@ def scan_block(text, codes, loc, results, seen, ocr=False):
     on (loc, code) so a code repeated on the same page is reported once. ocr marks
     rows that came from OCR of a scanned page (lower confidence).
     """
-    dates = all_dates(text)
+    dates_body, dates_header = date_candidates(text)
     low = text.lower()
     careplan = any(mk in low for mk in CAREPLAN_MARKERS)
     for m in CODE_RE.finditer(text):
@@ -722,7 +869,7 @@ def scan_block(text, codes, loc, results, seen, ocr=False):
             "loc": loc,
             "code": dotted(cat, sub),
             "desc": codes[dotless],
-            "date": nearest_date(dates, m.start()),
+            "date": pick_date(dates_body, dates_header, m.start()),
             "ocr": ocr,
             "sys": "icd10",
         })
@@ -798,9 +945,13 @@ def scan_other_codes(lines, loc_for, results, seen, ocr=False):
 # clinician and when they signed off. Neither is a diagnosis, but both are how you cite a record,
 # so they are lifted out and shown as a heading over the diagnoses they belong to - never dropped,
 # and never reported as findings in their own right.
-META_PAGE = re.compile(r'\bPage\s+([\d,]+)\s+of\s+([\d,]+)\b', re.I)
+# Both footer forms real records print: "Page 437 of 1,019" and "Page 157/191". Only this
+# exact shape is metadata - a rule dropping every line with the word "page" would eat a
+# genuine diagnosis note, so the number-of/slash-number shape is required.
+META_PAGE = re.compile(r'\bPage\s+([\d,]+)\s*(?:of|/)\s*([\d,]+)\b', re.I)
 META_REVIEWED = re.compile(r'\bLast\s+Reviewed\s+Date\s*:\s*(.+)$', re.I)
-META_SKIP = re.compile(r'^\s*(?:Page\s+[\d,]+\s+of\s+[\d,]+\s*$|Last\s+Reviewed\s+Date\s*:)', re.I)
+META_SKIP = re.compile(r'^\s*(?:Page\s+[\d,]+\s*(?:of|/)\s*[\d,]+\s*$|'
+                       r'Last\s+Reviewed\s+Date\s*:)', re.I)
 
 
 def scan_page_meta(lines):
@@ -908,6 +1059,9 @@ STOP_PREFIX = (
     "payer", "group", "policy", "signed", "electronically", "provider", "physician",
     "department", "encounter", "specialty", "careteam", "results", "labresult", "component",
     "narrative", "authorizing", "performing", "collection", "specimen", "comment",
+    # a "Laboratories" section heading ends a named-diagnosis list: what follows is lab
+    # result wrappers, not diagnoses
+    "laborator",
     # lab / imaging table column labels that otherwise leak into the list
     "analysis", "performed", "time", "value", "laterality", "modality", "anatomical",
     "impressions", "testmethod", "refrange", "range", "resulttype", "resultstatus",
@@ -967,6 +1121,27 @@ RULE_PUNCT = re.compile(r"['\"\-_]")
 UNREADABLE = re.compile(r'�|^\s*\.{2,}')
 
 
+# A laboratory RESULT wrapper posing as a diagnosis: "LIPID PANEL (80061) Final, Reviewed
+# (Collected: 02/01/2018)". The safe signature is the COMBINATION of a parenthesized bare
+# five-digit CPT code and lab result/status/collection wording - either alone is not enough.
+# Deliberately narrow: a diagnosis carrying parentheses ("Dyslipidemia (high LDL; low HDL)")
+# has no bare five-digit group, and a five-digit number without the status wording is left
+# for the existing filters, so neither broad shape is rejected on its own.
+LAB_WRAPPER = re.compile(
+    r'\(\s*\d{5}\s*\)[^\n]*\b(?:final|reviewed|collected\s*:)|'
+    r'\b(?:final|reviewed|collected\s*:)[^\n]*\(\s*\d{5}\s*\)', re.I)
+
+# The other two lines of the same print footer the page counter belongs to, confirmed leaking
+# as diagnoses on real records ("03/25/2026 11:58 am" / "SAMPLE, PATIENT DOB 01/01/1970"):
+# a line that is NOTHING BUT a date with an optional clock time, and a line carrying a DOB
+# label immediately followed by its date. No real diagnosis has either shape; a diagnosis
+# that merely CONTAINS a date ("Fracture, seen 03/25/2026 for follow-up") matches neither.
+TIMESTAMP_LINE = re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}(?:\s+\d{1,2}:\d{2}'
+                            r'(?:\s*[ap]\.?m\.?)?)?$', re.I)
+DOB_BANNER = re.compile(r'\b(?:d\.?\s?[o0]\.?\s?b\.?|date\s+of\s+birth)\b\s*:?\s*'
+                        r'\d{1,2}/\d{1,2}/\d{2,4}', re.I)
+
+
 def is_block_noise(name):
     """Packaging that sits INSIDE a diagnosis list: a column label the text layer mangled,
     clinic letterhead, the ruled blanks off a fax form, undecodable crumbs.
@@ -977,6 +1152,10 @@ def is_block_noise(name):
     NOISE_SQUASH already gives a garbled "Dia nosis" header.
     """
     if letters_only(name) in LABEL_LETTERS:
+        return True
+    if LAB_WRAPPER.search(name):
+        return True
+    if TIMESTAMP_LINE.match(name) or DOB_BANNER.search(name):
         return True
     if FIELD_TAIL.search(name) or META_FIELD.match(name):
         return True
@@ -1152,6 +1331,10 @@ _OCR_DPI = 200
 # Measured at about 6s a page on the machine this was built on.
 _OCR_SECS_PER_PAGE = 6
 _ENGINE = None
+# Structured results of the most recent completed run_extraction, for the optional claim
+# handoff document. None until a run completes; cleared at the start of every run so a
+# failed run cannot leave last week's results behind a working button.
+LAST_RUN = None
 _PROGRESS = None            # a GUI/caller can set this to receive progress lines
 _STOP = None                # a GUI/caller can set this to a callable meaning "stop early"
 
@@ -1483,6 +1666,135 @@ def gather(target, output=None):
     return sorted(files)
 
 
+HANDOFF_BOUNDARY = """This document organizes references found in the selected records. It is not medical or legal
+advice, an official VA mapping, a rating prediction, proof of service connection, or a
+recommendation about what to claim. Confirm every item against the source record."""
+
+
+def _handoff_dc_line(run, row):
+    """The honest Potential-DC status line for one diagnosis row, or "" when none applies.
+
+    Reuses dc_for_code and gem_bridge, so this line can NEVER say more than the report's own
+    cross-reference section says. An ambiguous vote is reported as a split, not an answer; a
+    missing reference is reported as unavailable, never papered over.
+    """
+    ref, gem = run["ref"], run["gem"]
+    if row.get("sys") == "icd10":
+        state, dc, name, basis = dc_for_code(ref, row["code"])
+        if state == "mapped":
+            return f"Potential VA DC : {dc} {name}  ({basis}) [research cross-reference]"
+        if state == "ambiguous":
+            return f"Potential VA DC : {basis}"
+        if state == "unmapped":
+            return "Potential VA DC : no mapping in the local reference"
+        return "Potential VA DC : reference data unavailable"
+    csys = str(row.get("csys", ""))
+    if csys.startswith("ICD-9"):
+        state, targets, dc, name, basis = gem_bridge(gem, ref, row["code"])
+        via = f" via ICD-10-CM {_gem_targets_text(targets)}" if targets else ""
+        if state == "mapped":
+            return f"Potential VA DC : {dc} {name}  ({basis}{via}) [research cross-reference]"
+        if state == "ambiguous":
+            return f"Potential VA DC : none - {basis}{via}"
+        if state == "unmapped":
+            return f"Potential VA DC : none - {basis}{via}"
+        return "Potential VA DC : bridge/reference data unavailable"
+    if csys.startswith("SNOMED"):
+        return "Potential VA DC : not looked up (no local SNOMED CT mapping ships with this tool)"
+    return ""
+
+
+def claim_handoff_text(run=None):
+    """The optional claim-organization handoff document, from the LAST completed run.
+
+    ORGANIZES ONLY. Every field below was already collected during extraction; nothing is
+    rescanned, inferred, or added. Raises ValueError when no completed extraction exists, so
+    the caller can say so instead of writing an empty file.
+    """
+    run = run or LAST_RUN
+    if not run:
+        raise ValueError("No completed extraction to organize - run an extraction first.")
+
+    out = []
+    out.append("CLAIM FILE HANDOFF - references organized from one extraction run")
+    out.append("=" * 78)
+    out.append(HANDOFF_BOUNDARY)
+    out.append("")
+    out.append(f"Scanned: {run['target']}")
+    out.append(f"When:    {run['when']}")
+    out.append(f"Report:  {run['output']}")
+    if run.get("unique"):
+        out.append("Options: duplicate diagnoses were collapsed (the (xN) counts show repeats).")
+    if run.get("stopped"):
+        out.append("STOPPED EARLY - this run was stopped by the user, so this is a PARTIAL")
+        out.append("organization of a partial scan, NOT a complete review of the records.")
+
+    # The handoff is a FINAL-RESULT surface, so the same consolidation applies: a bare parent
+    # whose specific child was extracted anywhere in the run is omitted here, while the page
+    # rows of the report keep it as source evidence. Only extracted ICD-10 rows participate.
+    all_icd10 = [r["code"] for f in run["files"] for r in f["rows"]
+                 if r.get("sys") == "icd10"]
+    keep = set(consolidate_codes(all_icd10))
+
+    n_rows = 0
+    for f in run["files"]:
+        out.append("")
+        out.append("=" * 78)
+        out.append(f"SOURCE FILE: {f['path']}")
+        if f["error"]:
+            out.append(f"   could not read: {f['error']}")
+            continue
+        if not f["rows"]:
+            out.append("   (no ICD-10 codes or named diagnoses found)")
+            continue
+        current = object()
+        for r in f["rows"]:
+            if r.get("sys") == "icd10" and r["code"] not in keep:
+                continue                     # a parent consolidated away by its own child
+            group = r["loc"] if f["grain"] == "page" else "(whole file)"
+            if group != current:
+                current = group
+                info = f["pages"].get(r["loc"]) or f["default"]
+                head = f"--- {group}"
+                if info.get("docpage"):
+                    head += f"   |   document page {info['docpage']}"
+                head += " ---"
+                out.append("")
+                out.append(head)
+                who = info.get("reviewer", "")
+                when = info.get("reviewed", "")
+                if who or when:
+                    out.append(f"Provider/reviewer : {who or '(name not given)'}"
+                               + (f"  (reviewed {when})" if when else ""))
+            n_rows += 1
+            desc = r["desc"]
+            if r.get("sys") == "icd10":
+                code_line = f"{r['code']} (ICD-10-CM)"
+            elif r.get("csys"):
+                code_line = f"{r['code']} [{r['csys']}] - NOT an ICD-10 code"
+                desc = re.sub(r'\s*\[[^\]]+\]\s*$', '', desc)
+            else:
+                code_line = "(named in the record with no code)"
+            out.append("")
+            out.append(f"Diagnosis : {desc}" + ("  (OCR - confirm against the source)"
+                                                if r.get("ocr") else ""))
+            out.append(f"Code      : {code_line}")
+            where = r["loc"] if f["grain"] != "page" else group
+            out.append(f"Where     : {os.path.basename(f['path'])}, {where}")
+            date = r["date"] or "(none found near this entry)"
+            out.append(f"Date      : {date}  (APPROXIMATE - nearest date on the page)"
+                       if r["date"] else f"Date      : {date}")
+            dc_line = _handoff_dc_line(run, r)
+            if dc_line:
+                out.append(dc_line)
+
+    out.append("")
+    out.append("=" * 78)
+    out.append(f"{n_rows} diagnosis reference(s) across {len(run['files'])} file(s), organized")
+    out.append("from the report named above. Nothing here is advice about what to claim.")
+    return "\n".join(out) + "\n"
+
+
 def codes_from_report(report):
     """The bare ICD-10 codes out of a finished report - what the GUI's Copy button puts on the
     clipboard. Returns [] if the report's code block is empty."""
@@ -1504,21 +1816,23 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     should_stop() - if given - is polled between pages and files; when it returns True the scan
     ends early and the report is marked as partial. Raises FileNotFoundError if the code list is
     missing, ValueError if nothing to scan."""
-    global _OCR_ENABLED, _PROGRESS, _STOP
+    global _OCR_ENABLED, _PROGRESS, _STOP, LAST_RUN
     _OCR_ENABLED = not no_ocr
     _PROGRESS = progress
     _STOP = should_stop
+    LAST_RUN = None                    # cleared first: a failed run must not leave stale results
 
     base = os.path.dirname(os.path.abspath(sys.argv[0]))
     codes = load_codes(base)                       # FileNotFoundError bubbles up to the caller
 
     files = gather(target, output)
     if not files:
-        raise ValueError("No supported files (.pdf .docx .txt .htm .html) to scan. "
+        raise ValueError("No supported files (.pdf .docx .txt .htm .html .xml) to scan. "
                          "(Reports written by this tool are skipped.)")
 
     total = 0
     stopped = False
+    captured = []                      # per-file structured results, for the claim handoff
     icd10_codes = []                               # every distinct ICD-10 code, for the paste block
     # Every distinct code the RECORD ITSELF labeled ICD-9-CM, for the bridge. Kept apart from
     # icd10_codes on purpose: these must never reach the paste block, which feeds an outside
@@ -1546,6 +1860,11 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
             stopped = True
         lines.append("")
         lines.append(path)
+        file_data = {"path": path, "error": res["error"], "rows": [],
+                     "grain": res["meta"].get("grain", "file"),
+                     "pages": res["meta"].get("pages", {}),
+                     "default": res["meta"].get("default") or {}}
+        captured.append(file_data)
         if res["error"]:
             lines.append(f"   could not read: {res['error']}")
             continue
@@ -1576,6 +1895,7 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
                 if counts[k] > 1:
                     r["desc"] = f"{r['desc']}  (x{counts[k]})"
                 rows.append(r)
+        file_data["rows"] = rows
         if not rows:
             lines.append("   (no ICD-10 codes or named diagnoses found)")
             continue
@@ -1632,9 +1952,16 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     # The cross-reference sits ABOVE the paste block, never below it: codes_from_report() reads
     # from the CODES_HEADING line to the end of the file, so anything added underneath would be
     # handed to whoever pressed Copy as if it were an ICD-10 code.
-    ref = load_dc_reference(base) if (icd10_codes or icd9_codes) else None
+    final_codes = consolidate_codes(icd10_codes)
+    ref = load_dc_reference(base) if (final_codes or icd9_codes) else None
     gem = load_gem_reference(base) if icd9_codes else None
-    lines.extend(dc_section(sorted(icd10_codes), ref,
+    LAST_RUN = {
+        "target": target, "output": output,
+        "when": f"{datetime.datetime.now():%Y-%m-%d %H:%M}",
+        "stopped": stopped, "unique": unique,
+        "files": captured, "ref": ref, "gem": gem,
+    }
+    lines.extend(dc_section(sorted(final_codes), ref,
                             f" ({DC_REF_NAME} is missing, damaged, or not vouched for by "
                             f"{DC_MANIFEST_NAME})",
                             icd9_found=sorted(icd9_codes), gem=gem,
@@ -1646,8 +1973,8 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     lines.append("")
     lines.append(f"{CODES_HEADING}  (paste into {CODES_URL})")
     lines.append("-" * 78)
-    if icd10_codes:
-        lines.extend(sorted(icd10_codes))
+    if final_codes:
+        lines.extend(sorted(final_codes))
     else:
         lines.append("(none found - every diagnosis above was named without an ICD-10 code, "
                      "or coded under another system)")

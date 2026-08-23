@@ -1,4 +1,4 @@
-ICD-10 Diagnosis Extractor  (version 2.0)
+ICD-10 Diagnosis Extractor  (version 2.1)
 =========================================
 
 NOT MEDICAL ADVICE. NOT LEGAL ADVICE. NO TOOL CATCHES EVERYTHING.
@@ -35,9 +35,22 @@ HOW TO RUN  (Windows)
      The progress bar moves while it works and the status line beside it shows
      the page it is on. Press Stop to end a long run early - what was found so
      far is kept, and the report is marked as a partial scan.
-     When it finishes: "Copy ICD-10 codes", "Open report", "Open folder".
+     When it finishes: "Copy ICD-10 codes", "Open report", "Open folder",
+     "Create Claim File Handoff".
      "Clear" resets the window for the next job. Enter also starts a run.
      The folder you used last is remembered for next time.
+
+THE CLAIM FILE HANDOFF (optional)
+  After a run finishes, "Create Claim File Handoff" writes a second document
+  beside the report, named  <report name>_claim_handoff.txt . It ORGANIZES what
+  the run already found - grouped by source file and page, one entry per
+  diagnosis with its code, page, nearest date, provider/reviewer when the
+  record names one, and the Potential VA Diagnostic Code research status.
+  Nothing is rescanned and nothing is added: it is the same information as the
+  report, arranged for handing to whoever works on the claim.
+  It is NOT medical or legal advice, NOT an official VA mapping, NOT a rating
+  prediction, and NOT a recommendation about what to claim. Confirm every item
+  against the source record.
 
 WHAT TO TRUST
   Code + description : reliable. Every code is checked against the official CDC
@@ -52,18 +65,23 @@ WHAT TO TRUST
                        paragraph number is shown instead; XML shows an entry number.
   Date               : APPROXIMATE - the nearest date to the code. With free-form
                        documents a date cannot be tied to a code with certainty.
-                       Always confirm against the source.
+                       Always confirm against the source. A date labeled as the
+                       patient's date of birth is never used, and a letterhead
+                       date repeated in the page banner yields to a date from
+                       the body of the page. Old dates are fine: a 1970s visit
+                       date is kept, never dropped for its age.
 
 OCR (scanned pages)
   Scanned/image PDF pages are read with OCR automatically; rows found that way are
   marked (OCR). OCR can misread characters, so confirm them against the source.
-  On OCR pages only specific codes (with a decimal, e.g. E11.65) are taken - bare
-  codes are dropped, because stray marks too easily spell a valid category. OCR is
-  about 3 seconds per scanned page; a big file can take several minutes (progress
-  prints as it goes). Use --no-ocr to skip it.
+  A bare category code (no decimal, e.g. L40) from OCR is kept only when its own
+  official description is written next to it, so stray marks that happen to spell
+  a valid code are still dropped. OCR takes a few seconds per scanned page; a big
+  file can take several minutes (progress prints as it goes). Tick "Skip scanned
+  pages" to skip it.
 
 NOT DONE
-  No old .doc (only .docx). No doctor/provider name.
+  No old .doc (only .docx).
 
 UPDATING THE CODE LIST
   icd10_data.tsv is the CDC ICD-10-CM code set (code <TAB> description). Replace it
@@ -78,11 +96,22 @@ PRIVACY
   ratemyvso.net address is printed in the report for you to visit yourself - the
   tool never sends anything anywhere.
 
+OPTIONAL REFERENCE FILES BESIDE THE PROGRAM
+  dc_reference.json + dc_reference.manifest.json          the Potential-VA-
+     Diagnostic-Code research cross-reference. SHIP AS A PAIR or not at all.
+  icd9_gem_reference.json + icd9_gem_reference.manifest.json   the ICD-9-CM
+     bridge into that same reference. Needs the pair above; SHIP AS A PAIR.
+  With any of them missing or damaged the program still extracts everything -
+  only the extra research section reports itself unavailable. See the report's
+  own wording: it is a research cross-reference, never an official VA mapping.
+
 FILES THIS TOOL WRITES BESIDE ITSELF
   icd_tool_accepted.txt   who accepted the terms, when, and for which version
   icd_tool_settings.txt   the folder you used last
   icd_tool_error.log      only if something went wrong (see below)
   (If this folder is read-only, these go to %LOCALAPPDATA%\ICD_Tool instead.)
+  Beside the RECORDS it writes icd10_report.txt and, on request,
+  icd10_report_claim_handoff.txt.
 
 IF THE WINDOW MISBEHAVES
   The window version has no console, so errors cannot print anywhere you would
@@ -101,5 +130,5 @@ IF THE WINDOW MISBEHAVES
      Tracing is off unless ICD_DEBUG=1, so it costs nothing the rest of the time.
 
   Note the first launch after a reboot is slower than later ones: the .exe is a
-  single 168 MB file that unpacks itself to a temporary folder each time it runs.
+  single file over a hundred megabytes that unpacks itself to a temporary folder each time it runs.
   Give it a few seconds before assuming it has died.

@@ -311,6 +311,8 @@ def _launch():
     copy_btn = ttk.Button(resultrow, text="Copy ICD-10 codes", style="Accent.TButton")
     open_report_btn = ttk.Button(resultrow, text="Open report", style="Secondary.TButton")
     open_folder_btn = ttk.Button(resultrow, text="Open folder", style="Secondary.TButton")
+    handoff_btn = ttk.Button(resultrow, text="Create Claim File Handoff",
+                             style="Secondary.TButton")
 
     def log_line(msg, tag=None):
         log.insert("end", msg + "\n", tag or ())
@@ -343,6 +345,7 @@ def _launch():
         copy_btn.pack_forget()
         open_report_btn.pack_forget()
         open_folder_btn.pack_forget()
+        handoff_btn.pack_forget()
         footer.grid_remove()
 
     def show_results():
@@ -350,6 +353,7 @@ def _launch():
         copy_btn.pack(side="left")
         open_report_btn.pack(side="left", padx=(8, 0))
         open_folder_btn.pack(side="left", padx=(8, 0))
+        handoff_btn.pack(side="left", padx=(8, 0))
 
     def set_running(running):
         extract_btn.configure(state="disabled" if running else "normal")
@@ -371,6 +375,36 @@ def _launch():
             os.startfile(p)               # Windows
         except Exception as e:
             log_line(f"Could not open: {e}")
+
+    def make_handoff():
+        """Write the claim-organization document beside the report, and open it.
+
+        Organizes what the finished run already found - never rescans. The button only shows
+        after a completed run, but the guard stays: Clear empties the report while the button
+        object still exists, and a stale LAST_RUN from an earlier target must never be
+        presented as this one's results.
+        """
+        if not state["report"] or not state["out"] or not icd_extract.LAST_RUN:
+            set_status("No completed extraction to organize - run an extraction first.", "bad")
+            return
+        try:
+            text = icd_extract.claim_handoff_text()
+        except ValueError as e:
+            set_status(str(e), "bad")
+            return
+        path = os.path.splitext(state["out"])[0] + "_claim_handoff.txt"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            set_status(f"Could not write the handoff document: {e}", "bad")
+            return
+        log_line("")
+        log_line("Claim file handoff saved to:", "head")
+        log_line(f"   {path}", "note")
+        set_status("Claim file handoff created - not medical or legal advice; confirm every "
+                   "item against the source record.", "good")
+        open_path(path)
 
     def copy_codes():
         codes = icd_extract.codes_from_report(state["report"] or "")
@@ -458,6 +492,7 @@ def _launch():
     stop_btn.configure(command=stop)
     clear_btn.configure(command=clear)
     copy_btn.configure(command=copy_codes)
+    handoff_btn.configure(command=make_handoff)
     open_report_btn.configure(command=lambda: open_path(state["out"]))
     open_folder_btn.configure(command=lambda: open_path(os.path.dirname(state["out"])))
     root.bind("<Return>", lambda e: start() if extract_btn["state"] != "disabled" else None)

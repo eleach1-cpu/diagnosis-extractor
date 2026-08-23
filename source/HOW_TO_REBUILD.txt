@@ -35,14 +35,30 @@ Refresh the code list (optional, yearly):
 Build the GUI exe (windowed, with icon):
   python -m PyInstaller --onefile --windowed --name icd_extract_gui ^
     --icon appicon.ico --add-data "appicon.ico;." --add-data "appicon.png;." ^
-    --collect-all rapidocr_onnxruntime --collect-all onnxruntime icd_gui.py
+    --collect-all rapidocr_onnxruntime ^
+    --collect-binaries onnxruntime --collect-data onnxruntime ^
+    --exclude-module onnxruntime.transformers --exclude-module onnxruntime.quantization ^
+    --exclude-module torch --exclude-module transformers --exclude-module accelerate ^
+    icd_gui.py
+
+  WHY THE EXCLUDES: --collect-all onnxruntime also collects onnxruntime.transformers
+  and onnxruntime.quantization, which are model-CONVERSION tools, not the runtime.
+  On a machine that happens to have transformers/accelerate/torch installed they
+  drag the whole CUDA stack into the exe - measured at 2.9 GB instead of ~125 MB,
+  with identical runtime behaviour. The runtime needs only the onnxruntime DLLs
+  (collect-binaries) and its data files (collect-data); the Python modules the
+  program actually imports are picked up by the normal dependency scan.
 
 The command-line exe is no longer shipped. icd_extract.py still has its argparse
 entry point, so if you ever want it back:
   python -m PyInstaller --onefile --console --name icd_extract ^
     --icon appicon.ico --hidden-import icd_gui ^
     --add-data "appicon.ico;." --add-data "appicon.png;." ^
-    --collect-all rapidocr_onnxruntime --collect-all onnxruntime icd_extract.py
+    --collect-all rapidocr_onnxruntime ^
+    --collect-binaries onnxruntime --collect-data onnxruntime ^
+    --exclude-module onnxruntime.transformers --exclude-module onnxruntime.quantization ^
+    --exclude-module torch --exclude-module transformers --exclude-module accelerate ^
+    icd_extract.py
 
 Rebuild the Potential-DC reference (optional, only when the crosswalk changes):
 
@@ -138,7 +154,12 @@ Rebuild the labeled-ICD-9-CM bridge (optional, only when the GEM changes):
   fetches, scrapes, infers or repairs a clinical mapping.
 
 Ship icd_extract_gui.exe together with icd10_data.tsv, appicon.ico and appicon.png
-in one folder (the .exe reads icd10_data.tsv from beside itself).
+in one folder (the .exe reads icd10_data.tsv from beside itself). docs\USER_GUIDE.txt
+goes in the same folder so the guide people read matches the build they run.
+
+The window's "Create Claim File Handoff" button needs nothing extra: it organizes
+the finished run's own results into <report name>_claim_handoff.txt beside the
+report, offline, without rescanning anything.
 
 If dc_reference.json is put in that same folder, the report gains a "Potential VA
 Diagnostic Code - research cross-reference" section. It is OPTIONAL: with the file

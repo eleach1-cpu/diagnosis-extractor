@@ -17,6 +17,19 @@ are reported with `-` in the code column. Scanned pages are read with OCR.
 The report ends with a paste-ready list of just the ICD-10 codes; the window has a **Copy ICD-10
 codes** button for the same list.
 
+The date column is approximate - the nearest date to the code. A date labeled as the patient's
+date of birth is never used, and a letterhead date repeated in a page's banner yields to a date
+from the body of the page. A date is never rejected for being old, and none is ever invented.
+
+## Claim File Handoff (optional)
+
+After a run finishes, **Create Claim File Handoff** writes a second document beside the report,
+`<report name>_claim_handoff.txt`. It organizes what the run already found - grouped by source
+file and page, one entry per diagnosis with its code, page, nearest date, provider/reviewer when
+the record names one, and the Potential-DC research status. Nothing is rescanned and nothing is
+added. It is not medical or legal advice, not an official VA mapping, not a rating prediction,
+and not a recommendation about what to claim.
+
 ## Potential VA Diagnostic Code (optional)
 
 If `dc_reference.json` sits beside the program, the report gains one extra section listing, for
