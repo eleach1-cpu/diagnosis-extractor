@@ -23,7 +23,7 @@ Usage:
     icd_extract  <file-or-folder>  [-o report.txt]
 """
 
-import sys, os, re, argparse, datetime
+import sys, os, re, json, hashlib, argparse, datetime
 
 VERSION = "2.1"
 
@@ -43,9 +43,53 @@ REPORT_BANNER = "ICD-10 diagnosis codes extracted"
 CODES_HEADING = "ICD-10 CODES"
 CODES_URL = "https://ratemyvso.net/dc/icd-codes"
 
+# ---- potential VA diagnostic code, a research cross-reference ---------------
+# An OPTIONAL local reference built by build_dc_reference.py from the RateMyVSO ICD-10-to-DC
+# crosswalk. It sits beside icd10_data.tsv and is read only when a report has ICD-10 codes to
+# look up. It is a research aid and nothing more: it may add a note beside a code that has
+# ALREADY been accepted, and it can never accept, reject, relabel or change a diagnosis. The
+# CDC code list remains the only authority on whether an ICD-10 code is real.
+#
+# The whole feature fails open. A missing, unreadable, malformed or wrong-schema file leaves
+# extraction and the original report exactly as they were, and the new section says so.
+DC_REF_NAME = "dc_reference.json"
+DC_MANIFEST_NAME = "dc_reference.manifest.json"
+DC_REF_SCHEMA = "icd10-dc-reference/1"
+DC_HEADING = "Potential VA Diagnostic Code - research cross-reference"
+
+# A rollup answers for a three-character CATEGORY and nothing else. This is fixed by the
+# schema, not read from the file: a length taken from the artifact would let a damaged artifact
+# widen the rule that is supposed to police it. If a future schema ever rolls up at another
+# depth, that is a schema version bump, not a value to be trusted at run time.
+DC_CATEGORY_LEN = 3
+
+# The agreement bar that separates an answer from a split vote, and the only confidence labels
+# this schema defines. Both are fixed HERE rather than read from the artifact, for the same
+# reason as the category length: a file must not be able to move the line that judges it.
+#
+# The floor is applied as exact integer arithmetic (votes * 100 >= floor * total) rather than a
+# percentage in floating point, so a vote sitting exactly on the bar cannot fall on one side in
+# the builder and the other side in the reader.
+DC_FLOOR_PERCENT = 60
+DC_CONFIDENCE_VALUES = ("verified", "high")
+
+# Metadata the artifact must carry before any of it is believed. A file that parses as JSON and
+# names the right schema can still be truncated, half-written or edited by hand, so the loader
+# checks the whole shape rather than the wrapper.
+DC_REQUIRED_META = {
+    "source": ("name", "sha256", "bytes", "rows"),
+    "code_list": ("name", "sha256", "rows"),
+    "policy": ("floor_percent", "category_length", "vote_basis"),
+    "counts": ("source_rows", "direct_usable", "cdc_missing", "direct_category_rows",
+               "derived_categories", "ambiguous_categories", "distinct_dcs"),
+}
+
 # ---- ICD-10 code shape -----------------------------------------------------
 # Letter (not U), a digit, then a digit/A/B; optionally a dot and 1-4 more.
 CODE_RE = re.compile(r'\b([A-TV-Z][0-9][0-9AB])(?:\.([0-9A-TV-Z]{1,4}))?\b')
+
+# The same shape anchored and without the decimal point, for validating a reference file's keys.
+CODE_KEY_RE = re.compile(r'^[A-TV-Z][0-9][0-9AB][0-9A-TV-Z]{0,4}$')
 
 # ---- date shapes (approximate binding) -------------------------------------
 DATE_RES = [
@@ -65,6 +109,235 @@ def load_codes(base_dir):
             if code:
                 codes[code] = desc
     return codes
+
+
+def _dc_names_ok(names):
+    """Every DC number maps to a non-empty name."""
+    for dc, name in names.items():
+        if not isinstance(dc, str) or not dc.isdigit():
+            return False
+        if not isinstance(name, str) or not name.strip():
+            return False
+    return True
+
+
+def _direct_ok(rows, names):
+    """Each direct row is exactly [diagnostic code, confidence], both real strings."""
+    for code, row in rows.items():
+        if not isinstance(code, str) or not CODE_KEY_RE.match(code):
+            return False
+        if not isinstance(row, list) or len(row) != 2:
+            return False
+        dc, conf = row
+        if not isinstance(dc, str) or dc not in names:
+            return False
+        # Only the labels this schema defines. A non-empty string was not enough: an invented
+        # label like "official" would have printed as `direct (official)`, claiming an authority
+        # this reference does not have and must never appear to have.
+        if conf not in DC_CONFIDENCE_VALUES:
+            return False
+    return True
+
+
+def _rollup_ok(rows, names, must_meet_floor):
+    """Each rollup row is exactly [diagnostic code, votes, total] and the vote is possible.
+
+    THE KEY MUST BE A THREE-CHARACTER CATEGORY. A rollup is the answer to "its children agree",
+    which is only a question a category can be asked. Accepting a detailed key here was a real
+    defect: a row like `"M2041": ["7816", 11, 12]` is well formed in every other respect, so it
+    validated, and then a specific code printed a borrowed category vote and an unrelated
+    diagnostic code as though the reference had answered for it. Hammer toe would have read as
+    Psoriasis, with a percentage next to it.
+
+    THE SECTION A ROW SITS IN IS A CLAIM ABOUT ITS VOTE, and the vote has to back it up.
+    `derived` means "these children agree well enough to answer", `ambiguous` means "they do
+    not". Checking only that a vote was arithmetically possible let the two swap: a 4-of-9 row
+    filed under `derived` printed `category, 4 of 9 agree (44%)` beside a diagnostic code, which
+    hands over an answer the data explicitly does not support.
+
+    `bool` is rejected explicitly because in Python it is a subclass of int, so True would
+    otherwise sail through as a vote count of 1.
+    """
+    for code, row in rows.items():
+        if not isinstance(code, str) or not CODE_KEY_RE.match(code):
+            return False
+        if len(code) != DC_CATEGORY_LEN:
+            return False
+        if not isinstance(row, list) or len(row) != 3:
+            return False
+        dc, votes, total = row
+        if not isinstance(dc, str) or dc not in names:
+            return False
+        if isinstance(votes, bool) or isinstance(total, bool):
+            return False
+        if not isinstance(votes, int) or not isinstance(total, int):
+            return False
+        if votes < 1 or total < 1 or votes > total:
+            return False
+        # Exact integer form of "votes/total >= floor%", so a row sitting precisely on the bar
+        # cannot be classified one way by the builder and the other way here.
+        meets = votes * 100 >= DC_FLOOR_PERCENT * total
+        if meets != must_meet_floor:
+            return False
+    return True
+
+
+def _manifest_agrees(base_dir, digest):
+    """True when the detached manifest vouches for exactly these bytes.
+
+    The manifest is REQUIRED, not optional. Its whole job is to be the thing that can say the
+    artifact is intact, and a missing witness is not the same as a passed check: half a written
+    file can still parse as JSON and name the right schema, and a wrong mapping printed beside
+    a veteran's diagnosis is worse than no mapping at all.
+    """
+    try:
+        with open(os.path.join(base_dir, DC_MANIFEST_NAME), encoding="utf-8") as f:
+            man = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(man, dict) or man.get("schema") != DC_REF_SCHEMA:
+        return False
+    art = man.get("artifact")
+    if not isinstance(art, dict):
+        return False
+    return art.get("name") == DC_REF_NAME and art.get("sha256") == digest
+
+
+def load_dc_reference(base_dir):
+    """The optional DC cross-reference from beside the program, or None.
+
+    NEVER RAISES, and never returns half-trusted data. Anything wrong answers None, which the
+    report renders as "unavailable": missing file, unreadable, not JSON, wrong schema, absent
+    or malformed metadata, a corrupted row in any section, a count that disagrees with the
+    section it counts, a missing manifest, or bytes the manifest does not vouch for.
+
+    The whole structure is checked before any of it is used. Validating only the wrapper was a
+    real defect: a row like `{"L400": "oops"}` passed, and then indexing that string produced a
+    confident, entirely fictional diagnostic code in the report. A reference problem must cost
+    a veteran the reference and nothing else, and it must never cost them a wrong answer.
+    """
+    path = os.path.join(base_dir, DC_REF_NAME)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        digest = hashlib.sha256(raw).hexdigest()
+        ref = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(ref, dict) or ref.get("schema") != DC_REF_SCHEMA:
+        return None
+    if not isinstance(ref.get("generated"), str) or not ref["generated"].strip():
+        return None
+    for block, fields in DC_REQUIRED_META.items():
+        meta = ref.get(block)
+        if not isinstance(meta, dict) or any(meta.get(f) in (None, "") for f in fields):
+            return None
+    # The file must agree with the rollup depth and the agreement bar this reader enforces. A
+    # file declaring some other policy is not one this schema version knows how to read, and
+    # trusting its numbers would let it move the line that judges its own contents.
+    if ref["policy"].get("category_length") != DC_CATEGORY_LEN:
+        return None
+    if ref["policy"].get("floor_percent") != DC_FLOOR_PERCENT:
+        return None
+    for section in ("direct", "derived", "ambiguous", "dc_names"):
+        if not isinstance(ref.get(section), dict):
+            return None
+
+    names = ref["dc_names"]
+    if not _dc_names_ok(names):
+        return None
+    if not _direct_ok(ref["direct"], names):
+        return None
+    if not _rollup_ok(ref["derived"], names, must_meet_floor=True):
+        return None
+    if not _rollup_ok(ref["ambiguous"], names, must_meet_floor=False):
+        return None
+
+    # A count that disagrees with what it counts means the file was cut short or edited, even
+    # when every surviving row is individually well formed.
+    counts = ref["counts"]
+    if counts.get("direct_usable") != len(ref["direct"]) or \
+            counts.get("derived_categories") != len(ref["derived"]) or \
+            counts.get("ambiguous_categories") != len(ref["ambiguous"]) or \
+            counts.get("distinct_dcs") != len(names):
+        return None
+    # A direct row always beats a rollup, so the two must never both answer for one code.
+    if set(ref["direct"]) & (set(ref["derived"]) | set(ref["ambiguous"])):
+        return None
+
+    if not _manifest_agrees(base_dir, digest):
+        return None
+    return ref
+
+
+def dc_for_code(ref, code):
+    """Look one extracted ICD-10 code up in the reference.
+
+    Returns (state, dc, name, basis). State is one of:
+      mapped      the reference answers for this exact code, or for its category
+      ambiguous   the category's children do not agree enough to answer
+      unmapped    the reference is fine and simply has no row for this code
+      unavailable no usable reference file
+    A specific code is NEVER replaced by its category: the rollup is consulted only when the
+    code itself has no direct row, which for a 3-character category IS the code itself.
+    """
+    if ref is None:
+        return "unavailable", "", "", ""
+    dotless = re.sub(r'[^0-9A-Za-z]', '', code).upper()
+    row = ref["direct"].get(dotless)
+    if row:
+        dc, conf = row[0], row[1]
+        return "mapped", dc, ref["dc_names"].get(dc, ""), f"direct ({conf})"
+    row = ref["derived"].get(dotless)
+    if row:
+        dc, votes, total = row[0], row[1], row[2]
+        pct = round(100.0 * votes / total) if total else 0
+        return "mapped", dc, ref["dc_names"].get(dc, ""), \
+            f"category, {votes} of {total} agree ({pct}%)"
+    row = ref["ambiguous"].get(dotless)
+    if row:
+        dc, votes, total = row[0], row[1], row[2]
+        pct = round(100.0 * votes / total) if total else 0
+        return "ambiguous", "", "", \
+            f"category vote split, top {dc} with {votes} of {total} ({pct}%)"
+    return "unmapped", "", "", ""
+
+
+def dc_section(codes_found, ref, ref_missing_reason=""):
+    """The report's cross-reference block, as a list of lines.
+
+    codes_found is the distinct ICD-10 codes the report holds, in the order they should print.
+    ICD-9 and SNOMED rows are deliberately NOT looked up here: this reference maps ICD-10-CM
+    only, and answering for another code system would be a guess wearing a confident face.
+    """
+    out = ["", DC_HEADING, "-" * 78]
+    if not codes_found:
+        out.append("No ICD-10 codes were found above, so there is nothing to look up.")
+        return out
+    out.append("A LOCAL RESEARCH AID ONLY. This is not an official VA crosswalk, not a rating,")
+    out.append("not an entitlement decision, and not advice about what to claim. It reports")
+    out.append("which VA diagnostic code a diagnosis is commonly rated under, nothing more.")
+    out.append("Confirm anything you rely on against the source document and 38 CFR Part 4.")
+    out.append("")
+    if ref is None:
+        out.append("Reference data unavailable, so no potential diagnostic codes could be")
+        out.append("looked up. EVERY DIAGNOSIS ABOVE IS UNAFFECTED: this section is the only")
+        out.append("thing missing.")
+        if ref_missing_reason:
+            out.append(f"Reason:{ref_missing_reason}")
+        return out
+    out.append(f"   {'ICD-10':<12} {'DC':<6} {'BASIS':<34} VA DIAGNOSTIC CODE")
+    out.append("   " + "-" * 75)
+    for code in codes_found:
+        state, dc, name, basis = dc_for_code(ref, code)
+        if state == "mapped":
+            out.append(f"   {code:<12} {dc:<6} {basis:<34} {name}")
+        elif state == "ambiguous":
+            out.append(f"   {code:<12} {'-':<6} {basis}")
+        else:
+            out.append(f"   {code:<12} {'-':<6} no mapping in this reference")
+    return out
 
 
 def all_dates(text):
@@ -1063,6 +1336,14 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
         lines.append(f"{len(ocr_needed)} file(s) have scanned/image pages that need OCR:")
         for p in ocr_needed:
             lines.append(f"   - {p}")
+
+    # The cross-reference sits ABOVE the paste block, never below it: codes_from_report() reads
+    # from the CODES_HEADING line to the end of the file, so anything added underneath would be
+    # handed to whoever pressed Copy as if it were an ICD-10 code.
+    ref = load_dc_reference(base) if icd10_codes else None
+    lines.extend(dc_section(sorted(icd10_codes), ref,
+                            f" ({DC_REF_NAME} is missing, damaged, or not vouched for by "
+                            f"{DC_MANIFEST_NAME})"))
 
     # The bare code list goes LAST so it is easy to select, and so codes_from_report can simply
     # read to the end of the file.

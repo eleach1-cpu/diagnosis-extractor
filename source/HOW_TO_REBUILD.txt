@@ -9,9 +9,13 @@ Files
                     (used by both windows; imported lazily by icd_disclaimer so
                      the command-line side never pulls in tkinter)
   build_icd_data.py builds icd10_data.tsv from the CDC order file
+  build_dc_reference.py
+                    builds dc_reference.json, the optional Potential-VA-
+                    Diagnostic-Code research cross-reference (see below)
 
   No new packaging step: PyInstaller follows the imports, so icd_theme.py and
-  icd_disclaimer.py are picked up by the same command below.
+  icd_disclaimer.py are picked up by the same command below. build_dc_reference.py
+  is a build-time tool and is NOT imported by the program, so it is not bundled.
 
 One-time setup (Python 3.11+):
   pip install pymupdf python-docx beautifulsoup4 rapidocr-onnxruntime pillow pyinstaller
@@ -33,5 +37,63 @@ entry point, so if you ever want it back:
     --add-data "appicon.ico;." --add-data "appicon.png;." ^
     --collect-all rapidocr_onnxruntime --collect-all onnxruntime icd_extract.py
 
+Rebuild the Potential-DC reference (optional, only when the crosswalk changes):
+
+  python build_dc_reference.py --ratemyvso <path to the RateMyVSO checkout> ^
+    --codes ..\app\icd10_data.tsv --out <folder>
+
+  or point straight at the file instead of the repository root:
+
+  python build_dc_reference.py --crosswalk <path to icd10-dc-crosswalk.json> ^
+    --codes ..\app\icd10_data.tsv --out <folder>
+
+  There is no default path. The source lives in another repository which this one
+  does not depend on at runtime and never contacts over a network.
+
+  It writes two files:
+    dc_reference.json           the data the program reads
+    dc_reference.manifest.json  the detached build record
+
+  The manifest holds the artifact's own SHA-256 (a file cannot contain its own
+  hash), the source SHA-256 and byte count, the code-list SHA-256, the row
+  counts, and the ledger summary. The artifact itself repeats the source and
+  code-list hashes and carries the full ledger.
+
+  Checking a build:
+    - artifact SHA-256 matches dc_reference.manifest.json
+    - source SHA-256 matches the crosswalk you built from
+    - counts.direct_usable + counts.cdc_missing == counts.source_rows
+      (every source row lands in exactly one bucket, nothing dropped in silence)
+    - ledger.cdc_missing lists every crosswalk row naming a code the CDC list
+      does not contain. Those never become usable mappings and never vote in a
+      category rollup; they are kept so they can be audited rather than lost.
+    - ledger.quarantine_changed_outcome names any category whose answer changed
+      because of that exclusion.
+
+  --generated is an input, not a clock read, so two builds of the same inputs
+  produce byte-identical artifacts. Only the manifest carries a wall-clock time.
+
+  The builder fails loudly on a malformed row, an unsupported source shape, a
+  non-numeric diagnostic code, a colliding normalized key or a ledger imbalance.
+  It never fetches, scrapes, infers or repairs a clinical mapping.
+
 Ship icd_extract_gui.exe together with icd10_data.tsv, appicon.ico and appicon.png
 in one folder (the .exe reads icd10_data.tsv from beside itself).
+
+If dc_reference.json is put in that same folder, the report gains a "Potential VA
+Diagnostic Code - research cross-reference" section. It is OPTIONAL: with the file
+missing, unreadable or malformed the program still extracts everything and the
+section simply reports the reference as unavailable. Nothing else in the report
+changes either way, and the final ICD-10 CODES block is unaffected.
+
+  SHIP BOTH FILES OR NEITHER. dc_reference.manifest.json is REQUIRED at run time,
+  not just at build time: the program hashes dc_reference.json on load and uses it
+  only if the manifest vouches for exactly those bytes. Ship the artifact alone and
+  the section reports the reference as unavailable, by design.
+
+  It is checked that hard because the failure being prevented is not a crash. A
+  half-written or edited artifact can still be valid JSON naming the right schema,
+  and the section would then print a confident, wrong diagnostic code beside a
+  veteran's diagnosis. Every row is also shape-checked on load, and the stored
+  counts must match the sections they count, so truncation is caught even when the
+  surviving rows are individually fine.
