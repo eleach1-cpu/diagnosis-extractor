@@ -1,4 +1,4 @@
-ICD-10 Diagnosis Extractor  (version 2.2)
+ICD-10 Diagnosis Extractor  (version 3.0)
 =========================================
 
 NOT MEDICAL ADVICE. NOT LEGAL ADVICE. NO TOOL CATCHES EVERYTHING.
@@ -16,8 +16,9 @@ WHAT IT DOES
 
      file | page/line | code | description | nearest date
 
-  Diagnoses coded under ICD-9-CM or SNOMED CT are listed too, tagged with that
-  system so they are not mistaken for ICD-10.
+  Entries coded under ICD-9-CM or SNOMED CT are listed too, tagged with that
+  system so they are not mistaken for ICD-10. A SNOMED tag also says what the
+  entry is - a disorder, a finding, a procedure, an event or a situation.
 
   The report ends with a plain list of just the ICD-10 codes, ready to paste
   into a lookup tool such as  https://ratemyvso.net/dc/icd-codes .
@@ -43,11 +44,53 @@ HOW TO RUN  (Windows)
 THE CLAIM FILE HANDOFF (optional)
   After a run finishes, "Create Claim File Handoff" writes a second document
   beside the report, named  <report name>_claim_handoff.txt . It ORGANIZES what
-  the run already found - grouped by source file and page, one entry per
-  diagnosis with its code, page, nearest date, provider/reviewer when the
-  record names one, and the Potential VA Diagnostic Code research status.
-  Nothing is rescanned and nothing is added: it is the same information as the
-  report, arranged for handing to whoever works on the claim.
+  the run already found. Nothing is rescanned and nothing is added: it is the
+  same information as the report, arranged for whoever works on the claim.
+
+  Five sections, in the order you actually need them:
+
+  1. RUN SUMMARY   how many entries were kept and where they went, plus a short
+                   name for each source file (F1, F2, ...) so a long filename is
+                   not repeated on every line.
+  2. POTENTIAL VA DIAGNOSTIC-CODE RESEARCH MATCHES
+                   the useful part first. Entries are grouped by the diagnostic
+                   code the local reference returned for them. Grouping means
+                   the reference gave the same code, NOT that this document says
+                   they are the same condition. Every original code and
+                   description is kept exactly as the record wrote it.
+  3. OTHER DIAGNOSES AND FINDINGS WITH NO LOCAL VA DC MATCH
+                   said once for the whole section instead of after every entry.
+                   No local result does not mean the entry does not matter.
+  4. ADMINISTRATIVE, PROCEDURAL, AND ENTRIES TO VERIFY
+                   things that are NOT diagnoses and are no longer presented as
+                   ones: Z-code encounters and status codes, SNOMED procedures
+                   and events, and named entries the record did not say enough
+                   about. An entry that reads like an ordered laboratory test
+                   (for example "HGB A1C (Tosoh G8) (83036) Ordered") is put here
+                   with the reason printed, never called a diagnosis.
+  5. DETAILED SOURCE-PAGE INDEX
+                   the complete evidence, page by page, exactly as before.
+                   Nothing was removed to shorten the sections above: every
+                   entry appears once up there and once down here.
+
+  Reading the compact columns:
+     SOURCE   F1 p5/d2 is source file F1, extracted page 5, the page the
+              document itself numbers 2. No /d means the document printed no
+              page number of its own, and "F1 line 12" means the file has no
+              pages at all.
+     DATE     a trailing * means APPROXIMATE, the nearest date on that page.
+     SEEN     how many times the entry appeared, shown only when duplicates
+              were collapsed for the run.
+
+  Each entry is labeled for what it is: Diagnosis, Finding/symptom, Finding,
+  Procedure, Event, Situation, Status/encounter, Test order, or Clinical entry.
+  An ICD-10 R-code (Snoring, chest pain, dizziness) is something the record
+  OBSERVED, not a disease a doctor diagnosed, so it is labeled Finding/symptom.
+  It keeps its code and its research result; only the word changes.
+
+  Where a section says the local reference had no result, it says so ONCE at the
+  top rather than after every row. In the page-by-page appendix an entry with no
+  "Potential VA DC" line is one the reference simply has no row for.
   It is NOT medical or legal advice, NOT an official VA mapping, NOT a rating
   prediction, and NOT a recommendation about what to claim. Confirm every item
   against the source record.
@@ -60,7 +103,11 @@ WHAT TO TRUST
                        do not sneak in.
   CODE "-"           : a diagnosis named in the record with no code at all.
   [ICD-9-CM]         : coded under ICD-9, not ICD-10. Kept for completeness. Do
-  [SNOMED CT]          not paste these into an ICD-10 lookup tool.
+  [SNOMED CT ...]      not paste these into an ICD-10 lookup tool. With the
+                       optional reference files installed, the research section
+                       at the end shows what each one maps to in ICD-10-CM. A
+                       SNOMED tag also names what the entry IS, such as
+                       [SNOMED CT procedure] or [SNOMED CT event].
   Page number        : real for PDF. Word/Text/HTML have no pages, so a line or
                        paragraph number is shown instead; XML shows an entry number.
   Date               : APPROXIMATE - the nearest date to the code. With free-form
@@ -101,9 +148,79 @@ OPTIONAL REFERENCE FILES BESIDE THE PROGRAM
      Diagnostic-Code research cross-reference. SHIP AS A PAIR or not at all.
   icd9_gem_reference.json + icd9_gem_reference.manifest.json   the ICD-9-CM
      bridge into that same reference. Needs the pair above; SHIP AS A PAIR.
+  snomed_icd10cm_reference.json.gz + snomed_icd10cm_reference.manifest.json
+     the SNOMED CT map into that same reference, and what each SNOMED code IS.
+     SHIP AS A PAIR. About 7 MB, and it is read straight out of the .gz - it is
+     never unpacked into a 61 MB file beside the program. It works on its own: if
+     the DC pair above is missing you still get the ICD-10-CM translation, and
+     only the VA diagnostic code says it is unavailable.
   With any of them missing or damaged the program still extracts everything -
   only the extra research section reports itself unavailable. See the report's
   own wording: it is a research cross-reference, never an official VA mapping.
+
+SNOMED CT CODES (only when the map file above is installed)
+  Records often code their problem list in SNOMED CT. Those rows are always
+  reported and tagged [SNOMED CT]. With the map installed, the report also shows
+  which ICD-10-CM code the licensed SNOMED CT US Edition map gives. The SNOMED
+  code in your record's rows never changes, and a mapped code is never added to
+  the ICD-10 paste list.
+
+A SNOMED CODE IS NOT ALWAYS A DIAGNOSIS - READ THE TYPE
+  SNOMED numbers name diseases, but they also name findings, procedures, events
+  and situations. An appendectomy has a SNOMED code. So does "exposure to
+  COVID-19", and that one translates cleanly to an ICD-10-CM code - which says
+  only that the two coding systems agree on the words. It does NOT say a doctor
+  found you had COVID-19.
+
+  So every SNOMED row now says what it is:
+
+     [SNOMED CT disorder]   a disease or condition
+     [SNOMED CT finding]    something observed, like chest pain
+     [SNOMED CT procedure]  an operation or treatment
+     [SNOMED CT event]      something that happened, like an exposure
+     [SNOMED CT situation]  a circumstance, like a family history
+     [SNOMED CT]            the map could not tell us which
+
+  ONLY A DISORDER is offered a potential VA diagnostic code. A procedure, a
+  finding, an event, a situation, or an entry whose type could not be read is
+  listed in its own "SNOMED CT clinical concepts" section near the end, with what
+  it is and what it translates to, and nothing is suggested for it. Your record's
+  entry is never removed or reworded: only the label on it changes.
+
+  If you believe an entry is your diagnosis and the tool calls it something else,
+  the tool is repeating what the official SNOMED release says that number means.
+  Check the number against your record.
+
+  Read the MAP BASIS column too, because it decides how much the row is worth:
+
+  direct, unconditional
+     One clear target. Looked up like any ICD-10 code.
+  multiple unconditional map groups
+     The map gives SEVERAL ICD-10-CM codes that apply TOGETHER. Each is looked
+     up separately and you get more than one answer. That is correct, not a
+     contradiction.
+  conditional map, review required
+     The map cannot finish without something only the record can tell it - a
+     patient's age at onset, type 1 versus type 2 diabetes, whether this is a
+     first visit or a follow-up. The possible codes and the map's own conditions
+     are listed and NOTHING is chosen for you. No diagnostic code is shown,
+     on purpose. Decide it against the record yourself.
+  no ICD-10-CM classification from this map
+     The map says this concept cannot be classified with the data available.
+  not in this SNOMED CT to ICD-10-CM map
+     The number is not in the map at all.
+
+  A code ending in "?" such as T14.8XX? is not a finished code. The "?" is a
+  character the map could not supply (first visit, follow-up, or a lasting
+  after-effect). Those rows are always marked for review.
+
+  Only codes the record LABELS "SNOMED" or "SNOMED CT", or an XML entry carrying
+  the SNOMED CT code system, are ever crossed. A bare long number in a record is
+  usually an account or accession number and is never treated as a diagnosis.
+
+  The map is the licensed SNOMED CT US Edition (March 2026), and so is the list
+  of what each code IS. It is a terminology map, not a VA document: the result is
+  research, never a rating or a decision.
 
 FILES THIS TOOL WRITES BESIDE ITSELF
   icd_tool_accepted.txt   who accepted the terms, when, and for which version

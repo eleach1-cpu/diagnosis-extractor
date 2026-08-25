@@ -32,9 +32,9 @@ Usage:
     icd_extract  <file-or-folder>  [-o report.txt]
 """
 
-import sys, os, re, json, hashlib, argparse, datetime
+import sys, os, re, json, gzip, hashlib, argparse, datetime
 
-VERSION = "2.2"
+VERSION = "3.0"
 
 SUPPORTED = (".pdf", ".docx", ".txt", ".htm", ".html", ".xml")
 
@@ -65,6 +65,10 @@ DC_REF_NAME = "dc_reference.json"
 DC_MANIFEST_NAME = "dc_reference.manifest.json"
 DC_REF_SCHEMA = "icd10-dc-reference/1"
 DC_HEADING = "Potential VA Diagnostic Code - research cross-reference"
+# Its own section, deliberately not a sub-block of the one above: a procedure or an exposure
+# printed under a "Potential VA Diagnostic Code" heading reads as a diagnosis whatever the
+# wording next to it says.
+SNOMED_HEADING = "SNOMED CT clinical concepts - terminology cross-reference"
 
 # A rollup answers for a three-character CATEGORY and nothing else. This is fixed by the
 # schema, not read from the file: a length taken from the artifact would let a damaged artifact
@@ -148,6 +152,176 @@ GEM_REQUIRED_META = {
 # the second overruns the column and jams the diagnostic code onto the end of the target list
 # where a reader cannot tell which is which.
 GEM_TARGETS_WIDTH = 18
+
+# ---- SNOMED CT to ICD-10-CM map, a third research cross-reference ----------
+# A THIRD optional local reference, built by build_snomed_icd10cm_reference.py from the
+# licensed SNOMED CT US Edition release. It sits beside dc_reference.json and is read only when
+# a report already holds a diagnosis the RECORD ITSELF labels SNOMED CT. It shows the ICD-10-CM
+# target or targets the licensed map gives, and looks up only the ones the map resolves without
+# needing patient context - each one INDEPENDENTLY, never voted across.
+#
+# It can never accept, reject, relabel or change a diagnosis. A mapped ICD-10-CM target is
+# never substituted for the SNOMED code in a report row nor added to the paste block: that
+# block feeds an outside ICD-10 lookup, and a SNOMED code converted behind the veteran's back
+# would be a confident wrong answer somewhere else.
+#
+# Like the other two references, the whole feature fails open. A missing, unreadable, malformed
+# or wrong-schema file costs the SNOMED block and nothing else.
+#
+# The artifact is GZIP, and is read straight out of gzip on every load. Uncompressed it is
+# roughly 48 MB, which is not a file to leave expanded beside a program people copy around;
+# compressed it is under 5 MB and decompresses in well under a second.
+SNOMED_REF_NAME = "snomed_icd10cm_reference.json.gz"
+SNOMED_MANIFEST_NAME = "snomed_icd10cm_reference.manifest.json"
+# /2 added the concept-type index. /1 files are REFUSED rather than read without types: a /1
+# artifact would answer every type lookup with "unavailable", and fail-closed eligibility would
+# then quietly drop the SNOMED lane's diagnostic answers with no explanation anyone could read.
+SNOMED_REF_SCHEMA = "snomed-icd10cm-map/2"
+
+# The US `ICD-10-CM complex map reference set`, and the international map that must NOT be
+# read in its place. 447562003 targets ICD-10, not ICD-10-CM, and this lane ends at an
+# ICD-10-CM lookup. Both are fixed HERE and checked against the artifact's declared policy, so
+# a file built from the wrong reference set is refused rather than believed.
+SNOMED_REFSET_ID = "6011000124106"
+SNOMED_INTL_REFSET_ID = "447562003"
+
+# The order of the fields inside one stored map row. The artifact repeats this list in its
+# policy block and the loader requires the two to agree, so the positional rows can be read by
+# a non-Python consumer without guessing what column 4 means.
+SNOMED_ROW_FIELDS = ("mapGroup", "mapPriority", "mapRule", "mapAdvice", "mapTarget",
+                     "correlationId", "mapCategoryId")
+
+# The only outcomes this schema defines for a SNOMED code. Fixed HERE, not read from the
+# artifact, for the same reason as the DC floor: a file must not be able to name an outcome the
+# reader has no rule for and have it printed anyway. `absent` is not stored in the artifact - it
+# is what a code that has no row at all resolves to - so the build receipt covers the other four.
+SNOMED_STATES = ("absent", "conditional", "direct", "multi_group", "no_classification")
+SNOMED_STORED_STATES = ("conditional", "direct", "multi_group", "no_classification")
+
+# "MAP SOURCE CONCEPT CANNOT BE CLASSIFIED WITH AVAILABLE DATA", the map's own category for a
+# row it declines to classify. Recorded for provenance; the blank target is what decides.
+SNOMED_CAT_NO_CLASSIFICATION = "447638001"
+
+# A SNOMED CT identifier: 6 to 18 digits. Used to validate the artifact's keys and to reject a
+# "map" row keyed on something that is not a concept identifier at all.
+SNOMED_KEY_RE = re.compile(r'^[0-9]{6,18}$')
+
+# An ICD-10-CM target AS THE LICENSED MAP WRITES IT: dotted, and possibly carrying a trailing
+# `?`. Deliberately NOT CODE_KEY_RE, which excludes the letter U so extraction never lifts a
+# U-code out of free text; the map legitimately targets U07.0, U07.1 and U09.9.
+SNOMED_TARGET_RE = re.compile(r'^[A-Z][0-9][0-9A-Z](?:\.[0-9A-Z]{1,4})?\??$')
+
+# THE TRAILING `?` IS A PLACEHOLDER, NOT PART OF A CODE, and this is the single most important
+# rule in this block. 55,317 active rows of the March 2026 US Edition carry a target such as
+# `T43.595?`, where the `?` stands for a 7th character the map cannot supply (initial encounter,
+# subsequent encounter, sequela). Every one of those rows also carries the advice EPISODE OF
+# CARE INFORMATION NEEDED - a 1:1 correspondence measured on the real release, not assumed.
+#
+# So a `?` target is a map that stopped short of an answer because it needs patient context,
+# which is exactly what "another rule requiring patient context" means: the concept is
+# CONDITIONAL and is never resolved. The `?` is also never stripped. Stripping it would turn an
+# admittedly incomplete code into one that looks finished, and `dc_for_code` would then happily
+# normalise `T43.595?` to `T43595` and print a confident diagnostic code for a mapping the
+# source explicitly declined to complete.
+SNOMED_PLACEHOLDER = "?"
+
+# ---- a SNOMED code is not automatically a diagnosis ------------------------
+# SNOMED CT codes disorders, and it also codes findings, events, situations, procedures,
+# substances, organisms and specimens. `840546002` is `Exposure to severe acute respiratory
+# syndrome coronavirus 2 (event)`. It maps directly and unconditionally to Z20.822, and it is
+# still not a diagnosis of COVID-19: a DIRECT map says the terminology translation needed no
+# patient context, never that the record confirmed a disease. Offering that event a potential
+# VA diagnostic code would put an exposure on a claim as if it were the illness.
+#
+# So the artifact carries a second index, concept id to the semantic tag of the concept's
+# active fully specified name, taken from the licensed release itself. The record's own
+# informal wording is never used to decide a type, and neither is the ICD-10-CM target.
+#
+# `900000000000003001` is `Fully specified name`. The Description file also carries synonyms,
+# which have no semantic tag at all.
+SNOMED_FSN_TYPE_ID = "900000000000003001"
+
+# THE ONLY TAG THAT OPENS THE DIAGNOSTIC LANE, and the reason nothing else has to be perfect.
+# Eligibility is an exact match on this one word, so an unreadable, misparsed or unheard-of tag
+# can never promote a concept to a diagnosis - it can only leave it reported as terminology,
+# which is the honest answer anyway.
+SNOMED_DIAGNOSIS_TAG = "disorder"
+
+# A semantic tag's shape, checked so a "tag" carrying a tab, a newline or a whole paragraph is
+# refused. One line of printable characters, 1 to 120 of them, no parenthesis. The longest in
+# this release is 93 characters, and it is a legacy fragment rather than a type. Deliberately
+# permissive about content: this release alone uses `regime/therapy`, `religion/philosophy`,
+# `SNOMED RT+CTV3`, `record artifact` and 150-odd others, plus legacy fragments like `& [hall]`
+# that sit in tag position, and a reader that decided which tags SNOMED is allowed to invent
+# would break on the next release rather than on a real defect. What protects the report is not
+# this pattern but SNOMED_DIAGNOSIS_TAG: nothing this lets through can spell `disorder`.
+# The parenthesis ban is the one content rule, and it is structural - see semantic_tag.
+SNOMED_TAG_RE = re.compile(r'^(?![ -~]*[()])[!-~][ -~]{0,119}$')
+
+# Metadata the artifact must carry before any of it is believed.
+SNOMED_REQUIRED_META = {
+    "source": ("name", "entry", "entry_sha256", "entry_bytes", "release_date",
+               "description_entry", "description_entry_sha256", "description_entry_bytes",
+               "description_release_date"),
+    "policy": ("refset_id", "excluded_refset_id", "row_fields", "states", "active_only",
+               "description_type_id", "diagnosis_tag"),
+    "counts": ("source_rows", "source_concepts", "distinct_targets", "blank_target_rows",
+               "placeholder_target_rows", "typed_concepts", "untyped_concepts"),
+}
+
+# Column widths for the SNOMED block. Each is sized to the widest thing that can land in it -
+# the basis column to "no ICD-10-CM classification from this map", the target column to its own
+# heading - because a column narrower than its contents does not truncate here, it SHIFTS every
+# column to its right, and a diagnostic code sitting under the wrong heading is a wrong answer
+# that no amount of careful wording upstream can undo.
+SNOMED_CODE_WIDTH = 18
+SNOMED_TARGET_WIDTH = 19
+SNOMED_BASIS_WIDTH = 41
+SNOMED_TYPE_WIDTH = 16
+
+# The user-facing name for each concept type, and the field label the Claim File Handoff puts
+# in front of the description. Only `disorder` is called a diagnosis. Anything else is named
+# for what it is, because a procedure filed as a diagnosis is a wrong claim, not a wording
+# quibble. A tag with no entry here is shown as "clinical concept: <tag>" - unrecognised is
+# not the same as unavailable, and the licensed release's own word for it is worth printing.
+SNOMED_TYPE_NAME = {
+    "disorder": "diagnosis",
+    "finding": "finding",
+    "procedure": "procedure",
+    "event": "event",
+    "situation": "situation",
+}
+SNOMED_TYPE_UNAVAILABLE = "clinical entry, type unavailable"
+SNOMED_HANDOFF_TYPE_LABEL = {
+    "disorder": "Diagnosis",
+    "finding": "Finding",
+    "procedure": "Procedure",
+    "event": "Event",
+    "situation": "Situation",
+}
+SNOMED_HANDOFF_TYPE_DEFAULT = "Clinical entry"
+
+# The wording for each state, in the report. These are the labels the map rules define, and
+# they are deliberately long enough to be unambiguous: "conditional map, review required" says
+# what a reader has to do, where a bare "conditional" does not.
+SNOMED_BASIS = {
+    "direct": "direct, unconditional",
+    "multi_group": "multiple unconditional map groups",
+    "conditional": "conditional map, review required",
+    "no_classification": "no ICD-10-CM classification from this map",
+    "absent": "not in this SNOMED CT to ICD-10-CM map",
+    "unavailable": "map data unavailable",
+}
+
+# The shorter vocabulary the Claim File Handoff's "Map basis" field uses.
+SNOMED_HANDOFF_BASIS = {
+    "direct": "direct",
+    "multi_group": "multiple groups",
+    "conditional": "conditional",
+    "no_classification": "no classification",
+    "absent": "not in this map",
+    "unavailable": "unavailable",
+}
 
 # ---- date shapes (approximate binding) -------------------------------------
 DATE_RES = [
@@ -651,6 +825,564 @@ def _gem_targets_text(targets, width=GEM_TARGETS_WIDTH):
     return ", ".join(shown) + (f" +{left} more" if left else "")
 
 
+def semantic_tag(term):
+    """The semantic tag of a SNOMED CT fully specified name, or "" when it has none.
+
+    The tag is the trailing parenthesis AT DEPTH ONE, found by walking the term backwards and
+    counting brackets, and A REAL SEMANTIC TAG NEVER CONTAINS A PARENTHESIS OF ITS OWN. Both
+    halves are needed because the release still carries legacy terms like
+
+        Osteotomy first metatarsal base (& for hallux valgus (& Golden))
+
+    whose trailing group closes inside another. Counting brackets finds that whole group
+    honestly; the no-nested-parenthesis rule then rejects it, because a group containing
+    brackets is a legacy fragment sitting in tag position, not a type. Three active concepts in
+    the March 2026 US Edition are shaped that way and all three come back empty.
+
+    THE LEGACY JUNK IS NOT ALL REACHABLE THIS WAY. Terms such as `... (flat foot NOS)` put a
+    bracket-free fragment in tag position and no structural rule can tell it from a tag SNOMED
+    might legitimately add next year. That is survivable, and it is why eligibility is an exact
+    match on SNOMED_DIAGNOSIS_TAG rather than a list of types to exclude: junk cannot spell
+    `disorder` by accident, so the worst it can do is have a concept described oddly, never
+    have a procedure offered a diagnostic code. Measured on this release, every one of the
+    139,598 mapped concepts carries a clean tag and none of the junk is in the map at all.
+
+    Empty is safe by construction, for the same reason: a tag that cannot be read leaves a
+    concept reported as a clinical entry and never as a diagnosis.
+    """
+    t = str(term).rstrip()
+    if not t.endswith(")"):
+        return ""
+    depth = 0
+    for i in range(len(t) - 1, -1, -1):
+        if t[i] == ")":
+            depth += 1
+        elif t[i] == "(":
+            depth -= 1
+            if depth == 0:
+                tag = t[i + 1:-1].strip()
+                return "" if ("(" in tag or ")" in tag) else tag
+    return ""
+
+
+def snomed_type(snomed, code):
+    """The licensed semantic tag for one SNOMED CT concept, or "" when it is not known.
+
+    "" covers every reason at once - no map installed, the concept is not in the release, the
+    release types it with a term that has no tag - because all of them lead to the same place:
+    the concept is reported as a clinical entry of unavailable type and is never treated as a
+    diagnosis. Distinguishing them would let a caller think one of them was safer than another.
+    """
+    if snomed is None:
+        return ""
+    key = str(code).strip()
+    if not SNOMED_KEY_RE.match(key):
+        return ""
+    tag = snomed["types"].get(key, "")
+    return tag if isinstance(tag, str) else ""
+
+
+def snomed_is_diagnosis(snomed, code):
+    """True only when the licensed release types this concept as a disorder.
+
+    FAILS CLOSED. Anything else - a finding, a procedure, an event, a situation, a tag this
+    program has never heard of, a concept the release does not type, a missing map - answers
+    False. An unknown type is never a diagnosis by default, because the cost of the two
+    mistakes is not symmetric: refusing a real disorder costs a research lookup, while
+    accepting a procedure puts it on a claim as if a doctor had diagnosed it.
+    """
+    return snomed_type(snomed, code) == SNOMED_DIAGNOSIS_TAG
+
+
+def snomed_type_name(snomed, code):
+    """What to call this concept in front of a veteran."""
+    tag = snomed_type(snomed, code)
+    if not tag:
+        return SNOMED_TYPE_UNAVAILABLE
+    return SNOMED_TYPE_NAME.get(tag, f"clinical concept: {tag}")
+
+
+def snomed_row_tag(snomed, code):
+    """The bracketed system tag for a SNOMED row in the report's diagnosis table.
+
+    `[SNOMED CT procedure]` when the release names a type, plain `[SNOMED CT]` when it does
+    not. The plain form is deliberate: with no map installed there is nothing to claim, and
+    inventing a word for the gap would be worse than leaving the row exactly as it reads today.
+    """
+    tag = snomed_type(snomed, code)
+    return f"SNOMED CT {tag}" if tag else "SNOMED CT"
+
+
+def snomed_state(rows):
+    """Which of the four stored states one concept's map rows are in.
+
+    THE MAP IS NOT A FLAT TABLE, and this is the whole reason the ICD-9 bridge's 60% vote is
+    not reused here. A concept carries map GROUPS, all of which apply together, and PRIORITIES
+    inside a group, of which exactly one applies - chosen by a rule that usually needs patient
+    context. Voting across those would average together codes that are meant to be used
+    together, and would silently pick one arm of a choice the map deliberately left open.
+
+      direct             one group, one row, rule TRUE, a resolved target
+      multi_group        several groups, each one unconditional row; ALL targets apply
+      conditional        a choice or a context the map cannot make on its own
+      no_classification  the map says this concept cannot be classified with available data
+
+    Anything conditional is REPORTED, never resolved. Four things make a concept conditional
+    and the last one is the one that is easy to miss:
+      - more than one row in a group (competing priorities);
+      - a rule that is not plain TRUE (IFA ..., OTHERWISE TRUE);
+      - a target carrying the `?` 7th-character placeholder - see SNOMED_PLACEHOLDER, this is
+        a map that stopped short because it needs the episode of care;
+      - a blank target sitting beside a real one, so the concept is only partly classified.
+        That combination does not occur in the March 2026 US Edition (every mixed-blank concept
+        there is already conditional for one of the reasons above), but a future release is not
+        obliged to keep it that way, and the honest answer to "half of this classified" is that
+        a human has to look.
+    """
+    groups = {}
+    for row in rows:
+        groups.setdefault(row[0], []).append(row)
+    if any(len(g) > 1 for g in groups.values()):
+        return "conditional"
+    if any(row[2] != "TRUE" for row in rows):
+        return "conditional"
+    if any(row[4].endswith(SNOMED_PLACEHOLDER) for row in rows):
+        return "conditional"
+    if all(not row[4] for row in rows):
+        return "no_classification"
+    if any(not row[4] for row in rows):
+        return "conditional"
+    return "direct" if len(groups) == 1 else "multi_group"
+
+
+def _snomed_advice_parts(advice):
+    """The advice segments split out, as the map writes them.
+
+    mapAdvice is a pipe-separated list whose first segment restates the rule ("ALWAYS R07.9",
+    "IF ... CHOOSE P36.9") and whose remaining segments are the official flags a coder is meant
+    to act on ("EPISODE OF CARE INFORMATION NEEDED"). Returns (rule_segment, [flags]).
+    """
+    parts = [p.strip() for p in str(advice).split("|")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return "", []
+    head = parts[0]
+    if head.startswith("ALWAYS ") or head.startswith("IF "):
+        return head, parts[1:]
+    return "", parts
+
+
+def _snomed_condition(rule, advice):
+    """When one row of a conditional concept applies, in the map's own words.
+
+    "IF AGE AT ONSET OF CLINICAL FINDING BEFORE 29.0 DAYS CHOOSE P36.9" is the map telling a
+    coder which arm to take, so the trailing CHOOSE is dropped (the target is already printed
+    in its own column) and the condition itself is kept verbatim. Nothing is paraphrased: a
+    reworded clinical condition is a new clinical claim.
+    """
+    if rule == "OTHERWISE TRUE":
+        return "otherwise"
+    head, _flags = _snomed_advice_parts(advice)
+    if head.startswith("IF "):
+        return re.sub(r'\s*CHOOSE\s+\S+\s*$', '', head)
+    return ""
+
+
+def _snomed_manifest_agrees(base_dir, digest):
+    """The detached manifest must vouch for exactly this filename and these bytes.
+
+    The digest is over the COMPRESSED file, because the .json.gz is what sits on disk and what
+    anything editing it would have to edit.
+    """
+    try:
+        with open(os.path.join(base_dir, SNOMED_MANIFEST_NAME), "rb") as f:
+            man = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(man, dict):
+        return False
+    art = man.get("artifact")
+    if not isinstance(art, dict):
+        return False
+    return art.get("name") == SNOMED_REF_NAME and art.get("sha256") == digest
+
+
+def _snomed_map_ok(rows_by_code):
+    """Every row of the map section, checked in full before any of it is used.
+
+    Same reasoning as the ICD-9 bridge's row check, with more to get wrong: a row here is a
+    POSITIONAL list of seven fields, so a short row would index out of range and a row of
+    strings where the group number belongs would sort in a way that quietly reorders
+    priorities. A wrong order is not a crash, it is a different answer.
+    """
+    for code, rows in rows_by_code.items():
+        if not isinstance(code, str) or not SNOMED_KEY_RE.match(code):
+            return False
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, list) or not rows:
+            return False
+        slots = set()
+        for row in rows:
+            if isinstance(row, (str, bytes)) or not isinstance(row, list):
+                return False
+            if len(row) != len(SNOMED_ROW_FIELDS):
+                return False
+            group, priority, rule, advice, target, correlation, category = row
+            # bool is a subclass of int, so True would otherwise pass as group 1.
+            if isinstance(group, bool) or isinstance(priority, bool):
+                return False
+            if not isinstance(group, int) or not isinstance(priority, int):
+                return False
+            if group < 1 or priority < 1:
+                return False
+            for value in (rule, advice, target, correlation, category):
+                if not isinstance(value, str):
+                    return False
+            if not rule:
+                return False
+            if target and not SNOMED_TARGET_RE.match(target):
+                return False
+            if not correlation.isdigit() or not category.isdigit():
+                return False
+            if (group, priority) in slots:
+                return False
+            slots.add((group, priority))
+    return True
+
+
+def _snomed_types_ok(types):
+    """Every row of the concept-type index, checked in full before any of it is used.
+
+    A key that is not a concept identifier would answer for the wrong concept; a value that is
+    not a string would crash a comparison or, worse, compare unequal to `disorder` and silently
+    demote a real diagnosis. An EMPTY tag is allowed on purpose - the release carries a handful
+    of legacy terms with no semantic tag, and refusing the whole file over them would cost the
+    types of half a million concepts to protect against six.
+    """
+    if not isinstance(types, dict) or not types:
+        return False
+    for code, tag in types.items():
+        if not isinstance(code, str) or not SNOMED_KEY_RE.match(code):
+            return False
+        if not isinstance(tag, str):
+            return False
+        if tag and not SNOMED_TAG_RE.match(tag):
+            return False
+    return True
+
+
+def load_snomed_reference(base_dir):
+    """The optional SNOMED CT to ICD-10-CM map from beside the program, or None.
+
+    NEVER RAISES, and never returns half-trusted data. Anything wrong answers None, which the
+    report renders as "unavailable": missing file, unreadable, not gzip, not JSON, wrong
+    schema, absent or malformed metadata, a corrupted row, a count that disagrees with what it
+    counts, a state vocabulary this reader has no rule for, a policy naming the wrong reference
+    set, a missing manifest, or bytes the manifest does not vouch for.
+
+    THE REFSET CHECK IS NOT A FORMALITY. The same source file also carries 447562003, the
+    international SNOMED CT to ICD-10 map, whose targets are ICD-10 rather than ICD-10-CM. An
+    artifact built from that would be structurally perfect and clinically wrong at the end of a
+    lane that finishes in an ICD-10-CM lookup, so the artifact has to say which reference set
+    it came from and it has to be the US one.
+
+    The `states` block is a BUILD RECEIPT and is validated for shape but never used as an
+    answer: every concept is classified live by snomed_state() when it is looked up, so the
+    receipt cannot make the program say something the rows do not support.
+    """
+    path = os.path.join(base_dir, SNOMED_REF_NAME)
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        digest = hashlib.sha256(blob).hexdigest()
+        ref = json.loads(gzip.decompress(blob).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, EOFError, gzip.BadGzipFile):
+        return None
+
+    if not isinstance(ref, dict) or ref.get("schema") != SNOMED_REF_SCHEMA:
+        return None
+    if not isinstance(ref.get("generated"), str) or not ref["generated"].strip():
+        return None
+    for block, fields in SNOMED_REQUIRED_META.items():
+        meta = ref.get(block)
+        if not isinstance(meta, dict) or any(meta.get(f) in (None, "") for f in fields):
+            return None
+    policy = ref["policy"]
+    if policy.get("refset_id") != SNOMED_REFSET_ID:
+        return None
+    if policy.get("excluded_refset_id") != SNOMED_INTL_REFSET_ID:
+        return None
+    if policy.get("active_only") is not True:
+        return None
+    # The artifact must lay its rows out in the order this reader unpacks them, and must name
+    # the same outcome vocabulary. Both are what let a non-Python consumer read the same file.
+    if policy.get("row_fields") != list(SNOMED_ROW_FIELDS):
+        return None
+    if policy.get("states") != list(SNOMED_STATES):
+        return None
+    # The artifact must agree about which description type carries the semantic tag, and about
+    # which single tag opens the diagnostic lane. A file that declared `finding` eligible would
+    # otherwise put every symptom on the claim side of the report.
+    if policy.get("description_type_id") != SNOMED_FSN_TYPE_ID:
+        return None
+    if policy.get("diagnosis_tag") != SNOMED_DIAGNOSIS_TAG:
+        return None
+    if not isinstance(ref.get("map"), dict) or not ref["map"]:
+        return None
+    if not isinstance(ref.get("ledger"), dict):
+        return None
+    if not _snomed_map_ok(ref["map"]):
+        return None
+    if not _snomed_types_ok(ref.get("types")):
+        return None
+
+    # A count that disagrees with what it counts means the file was cut short or edited, even
+    # when every surviving row is individually well formed.
+    rows_by_code = ref["map"]
+    all_rows = [row for rows in rows_by_code.values() for row in rows]
+    counts = ref["counts"]
+    if counts.get("source_concepts") != len(rows_by_code):
+        return None
+    if counts.get("source_rows") != len(all_rows):
+        return None
+    if counts.get("distinct_targets") != len({r[4] for r in all_rows if r[4]}):
+        return None
+    if counts.get("blank_target_rows") != sum(1 for r in all_rows if not r[4]):
+        return None
+    if counts.get("placeholder_target_rows") != sum(
+            1 for r in all_rows if r[4].endswith(SNOMED_PLACEHOLDER)):
+        return None
+
+    # The build receipt: shape only, and it must account for every stored concept under exactly
+    # the states this reader knows.
+    tally = ref.get("states")
+    if not isinstance(tally, dict) or sorted(tally) != sorted(SNOMED_STORED_STATES):
+        return None
+    for value in tally.values():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    if sum(tally.values()) != len(rows_by_code):
+        return None
+
+    # The same discipline for the type index: a count that disagrees with what it counts means
+    # the file was cut short or edited, even when every surviving row is well formed.
+    types = ref["types"]
+    typed = sum(1 for tag in types.values() if tag)
+    if counts.get("typed_concepts") != typed:
+        return None
+    if counts.get("untyped_concepts") != len(types) - typed:
+        return None
+    type_tally = ref.get("type_counts")
+    if not isinstance(type_tally, dict):
+        return None
+    recomputed = {}
+    for tag in types.values():
+        if tag:
+            recomputed[tag] = recomputed.get(tag, 0) + 1
+    if type_tally != recomputed:
+        return None
+
+    if not _snomed_manifest_agrees(base_dir, digest):
+        return None
+    return ref
+
+
+def snomed_map(snomed, ref, code):
+    """Cross one code the record LABELS SNOMED CT to its potential ICD-10-CM target(s).
+
+    Returns (state, findings, advice). State is one of SNOMED_STATES, or "unavailable" when
+    there is no usable MAP. A missing DC reference does NOT make the state unavailable: the
+    target and the map basis still answer, and only the diagnostic code at the end of the lane
+    reports itself unavailable through dc_for_code.
+
+    `findings` is one dict per target the reader should see:
+        target     the ICD-10-CM target exactly as the map writes it, `?` and all
+        condition  when the map only takes this arm under a condition, that condition
+        dc_state   mapped / ambiguous / unmapped, or "" when the target was never looked up
+        dc, name, basis   the Potential-DC answer for THIS target alone
+
+    EACH TARGET IS LOOKED UP INDEPENDENTLY AND THE RESULTS ARE NEVER COLLAPSED. Two map groups
+    mean both ICD-10-CM codes apply together, so two different diagnostic codes is the correct
+    answer, not a disagreement to be resolved by a vote. This is the one place where this lane
+    deliberately behaves differently from the ICD-9 bridge, where several targets are competing
+    renderings of ONE old code and a vote is the right shape.
+
+    A conditional or unclassifiable concept is never resolved and never looked up at all.
+    """
+    # THE TWO REFERENCES ARE INDEPENDENT AND ONLY THE MAP DECIDES THIS STATE. `ref` is the
+    # separate Potential-DC crosswalk, and it used to be checked here too, which meant a
+    # missing dc_reference.json reported the SNOMED MAP as unavailable - hiding a perfectly
+    # good terminology answer behind an unrelated file's absence, and telling the reader the
+    # wrong thing about which of their reference files is missing. A missing `ref` now costs
+    # exactly one thing: the diagnostic code at the END of the lane. The ICD-10-CM target and
+    # the map basis are still reported, and dc_for_code answers "unavailable" for itself.
+    if snomed is None:
+        return "unavailable", [], []
+    # A SNOMED CT concept identifier is ALL DIGITS, so the code is matched as written rather
+    # than scrubbed into shape. Stripping non-digits the way the ICD-9 lane does would be
+    # actively harmful here: the label pattern can capture a leading letter, and "SNOMED CT
+    # A123456" would then be looked up as concept 123456 and answer for a completely different
+    # concept than the one the record names. Anything that is not a concept identifier is
+    # simply not in the map, which is the honest answer.
+    key = str(code).strip()
+    rows = snomed["map"].get(key) if SNOMED_KEY_RE.match(key) else None
+    if not rows:
+        return "absent", [], []
+
+    state = snomed_state(rows)
+    advice, seen_advice = [], set()
+    for row in rows:
+        for flag in _snomed_advice_parts(row[3])[1]:
+            if flag not in seen_advice:
+                seen_advice.add(flag)
+                advice.append(flag)
+
+    findings = []
+    for group, priority, rule, row_advice, target, _corr, _cat in rows:
+        if not target:
+            continue
+        item = {"target": target, "condition": "", "dc_state": "", "dc": "", "name": "",
+                "basis": ""}
+        if state in ("direct", "multi_group"):
+            item["dc_state"], item["dc"], item["name"], item["basis"] = dc_for_code(ref, target)
+        else:
+            item["condition"] = _snomed_condition(rule, row_advice)
+        findings.append(item)
+    return state, findings, advice
+
+
+def _snomed_lines(snomed_found, ref, snomed, snomed_missing_reason=""):
+    """The SNOMED CT half of the cross-reference block, DISORDERS ONLY.
+
+    The SNOMED code stays exactly as the record wrote it, the ICD-10-CM target the licensed map
+    gives is printed beside it, and a diagnostic code is reached through that target only when
+    the map resolved it without needing patient context. A reader who disagrees with the map
+    can see the map.
+
+    ONLY A CONCEPT THE LICENSED RELEASE TYPES AS A DISORDER GETS THIS FAR. Owner ruling,
+    2026-08-24: a procedure is a procedure and an exposure is an exposure, and neither belongs
+    in a section headed "Potential VA Diagnostic Code" no matter how cleanly it maps. Everything
+    the record labelled SNOMED CT, of every type, is still reported in full in its own
+    terminology section below - see snomed_terminology_section - so nothing is hidden; what
+    changes is which of them is offered a diagnostic code.
+    """
+    out = ["",
+           "   Codes the record labels SNOMED CT and the licensed US Edition types as a",
+           "   DISORDER, crossed through the SNOMED CT to ICD-10-CM map and then looked up",
+           "   above. That map is a terminology map, not a VA document, and the SNOMED code in",
+           "   the rows above is unchanged. A target is looked up only where the map resolves",
+           "   it without needing patient context; anything conditional is reported for review,",
+           "   never answered. Findings, procedures, events and situations are NOT listed here;",
+           "   they are reported in the SNOMED CT terminology section below."]
+    if snomed is None:
+        out.append("   Map data unavailable, so these codes could not be crossed. EVERY")
+        out.append("   DIAGNOSIS ABOVE IS UNAFFECTED.")
+        if snomed_missing_reason:
+            out.append(f"   Reason:{snomed_missing_reason}")
+        return out
+    snomed_found = [c for c in snomed_found if snomed_is_diagnosis(snomed, c)]
+    if not snomed_found:
+        out.append("   No SNOMED CT code in this report is typed as a disorder by the licensed")
+        out.append("   release, so none is eligible for a potential diagnostic code. See the")
+        out.append("   SNOMED CT terminology section below for what each one actually is.")
+        return out
+    head = (f"   {'SNOMED CT':<{SNOMED_CODE_WIDTH}} "
+            f"{'POTENTIAL ICD-10-CM':<{SNOMED_TARGET_WIDTH}} "
+            f"{'MAP BASIS':<{SNOMED_BASIS_WIDTH}} DC / RESULT")
+    out.append(head)
+    # The rule is measured from the heading rather than fixed at 75 like the narrower blocks
+    # above, so widening a column can never leave a rule that stops short of its own table.
+    out.append("   " + "-" * (len(head) - 3))
+    for code in snomed_found:
+        state, findings, advice = snomed_map(snomed, ref, code)
+        basis = SNOMED_BASIS[state]
+        if not findings:
+            result = {"no_classification": "(none - the map declines to classify)",
+                      "absent": "(none)"}.get(state, "(none)")
+            out.append(f"   {code:<{SNOMED_CODE_WIDTH}} {'-':<{SNOMED_TARGET_WIDTH}} "
+                       f"{basis:<{SNOMED_BASIS_WIDTH}} {result}")
+        for n, item in enumerate(findings):
+            # The code and the basis are stated once; a continuation line carries only the
+            # extra target, so two targets never read as two separate SNOMED codes.
+            shown_code = code if n == 0 else ""
+            shown_basis = basis if n == 0 else ""
+            if item["dc_state"] == "mapped":
+                result = f"{item['dc']:<6} {item['name']}"
+            elif item["dc_state"] == "ambiguous":
+                result = item["basis"]
+            elif item["dc_state"] == "unmapped":
+                result = "no mapping in this reference"
+            elif item["dc_state"] == "unavailable":
+                # The map answered; the SEPARATE Potential-DC reference is the missing one, and
+                # saying so names the file the reader has to go and find.
+                result = "reference data unavailable"
+            else:
+                result = "(not resolved)"
+            out.append(f"   {shown_code:<{SNOMED_CODE_WIDTH}} "
+                       f"{item['target']:<{SNOMED_TARGET_WIDTH}} "
+                       f"{shown_basis:<{SNOMED_BASIS_WIDTH}} {result}")
+        for item in findings:
+            if item["condition"]:
+                out.append(f"        {item['target']} applies when: {item['condition']}")
+        for flag in advice:
+            out.append(f"        Map advice: {flag}")
+    return out
+
+
+def snomed_terminology_section(snomed_found, snomed, snomed_missing_reason=""):
+    """Every SNOMED CT code the record labelled, with what the licensed release says it IS.
+
+    A SEPARATE SECTION FROM THE POTENTIAL-DC ONE, and separate on purpose. The terminology map
+    is useful for a procedure, an event and a finding alike - knowing that
+    `Exposure to severe acute respiratory syndrome coronavirus 2 (event)` translates to Z20.822
+    is worth reporting - but that is a translation between coding systems, not a diagnosis, and
+    a reader who sees it under a "Potential VA Diagnostic Code" heading will reasonably read it
+    as one. So the translation is reported here, for every type, and the diagnostic lane above
+    admits disorders only.
+
+    Nothing here is ever added to the paste-ready ICD-10 block. The block feeds an outside
+    ICD-10 lookup, and a procedure's ICD-10-CM translation pasted into it would come back as a
+    confident diagnosis somewhere else.
+    """
+    out = ["", SNOMED_HEADING, "-" * 78]
+    out.append("What the licensed SNOMED CT US Edition says each of these codes IS, and what it")
+    out.append("translates to in ICD-10-CM. A TERMINOLOGY MAP, not a VA document and not a")
+    out.append("diagnosis: a direct map means the translation needed no patient context, never")
+    out.append("that the record confirmed a disease. Only a concept typed as a DISORDER is")
+    out.append("eligible for the potential diagnostic codes above. Nothing here is pasted into")
+    out.append("the ICD-10 list at the end.")
+    out.append("")
+    if snomed is None:
+        out.append("Map data unavailable, so these codes could not be typed or crossed. EVERY")
+        out.append("ENTRY ABOVE IS UNAFFECTED: this section is the only thing missing.")
+        if snomed_missing_reason:
+            out.append(f"Reason:{snomed_missing_reason}")
+        for code in snomed_found:
+            out.append(f"   {code}")
+        return out
+    head = (f"   {'SNOMED CT':<{SNOMED_CODE_WIDTH}} {'TYPE':<{SNOMED_TYPE_WIDTH}} "
+            f"{'POTENTIAL ICD-10-CM':<{SNOMED_TARGET_WIDTH}} "
+            f"{'MAP BASIS':<{SNOMED_BASIS_WIDTH}}")
+    out.append(head.rstrip())
+    # Measured from the PADDED header, not the trimmed one, so the rule still reaches the end
+    # of the widest basis this table can print rather than stopping under the word MAP BASIS.
+    out.append("   " + "-" * (len(head) - 3))
+    for code in snomed_found:
+        state, findings, advice = snomed_map(snomed, None, code)
+        kind = snomed_type_name(snomed, code)
+        basis = SNOMED_BASIS[state]
+        targets = [item["target"] for item in findings] or ["-"]
+        for n, target in enumerate(targets):
+            out.append(f"   {(code if n == 0 else ''):<{SNOMED_CODE_WIDTH}} "
+                       f"{(kind if n == 0 else ''):<{SNOMED_TYPE_WIDTH}} "
+                       f"{target:<{SNOMED_TARGET_WIDTH}} {basis if n == 0 else ''}".rstrip())
+        for item in findings:
+            if item["condition"]:
+                out.append(f"        {item['target']} applies when: {item['condition']}")
+        for flag in advice:
+            out.append(f"        Map advice: {flag}")
+    return out
+
+
 def consolidate_codes(codes):
     """Final-result consolidation: drop a bare 3-character parent when a more specific child
     from the same category was extracted anywhere in the SAME RUN.
@@ -670,19 +1402,19 @@ def consolidate_codes(codes):
 
 
 def dc_section(codes_found, ref, ref_missing_reason="", icd9_found=(), gem=None,
-               gem_missing_reason=""):
+               gem_missing_reason="", snomed_found=(), snomed=None, snomed_missing_reason=""):
     """The report's cross-reference block, as a list of lines.
 
     codes_found is the distinct ICD-10 codes the report holds, in the order they should print.
     icd9_found is the distinct codes the RECORD ITSELF labeled ICD-9-CM, which are bridged
-    through the GEM to ICD-10-CM and only then looked up here.
+    through the GEM to ICD-10-CM and only then looked up here. snomed_found is the distinct
+    codes the record labeled SNOMED CT, crossed through the licensed US map the same way.
 
-    SNOMED rows are deliberately NOT looked up at all: no local mapping from SNOMED ships with
-    this program, and answering for a code system it cannot read would be a guess wearing a
-    confident face.
+    Each of the three lanes is independent and each fails open on its own: a broken bridge
+    costs the ICD-9 block, a broken map costs the SNOMED block, and neither costs a diagnosis.
     """
     out = ["", DC_HEADING, "-" * 78]
-    if not codes_found and not icd9_found:
+    if not codes_found and not icd9_found and not snomed_found:
         out.append("No ICD-10 codes were found above, so there is nothing to look up.")
         return out
     out.append("A LOCAL RESEARCH AID ONLY. This is not an official VA crosswalk, not a rating,")
@@ -710,6 +1442,8 @@ def dc_section(codes_found, ref, ref_missing_reason="", icd9_found=(), gem=None,
                 out.append(f"   {code:<12} {'-':<6} no mapping in this reference")
     if icd9_found:
         out.extend(_icd9_bridge_lines(icd9_found, ref, gem, gem_missing_reason))
+    if snomed_found:
+        out.extend(_snomed_lines(snomed_found, ref, snomed, snomed_missing_reason))
     return out
 
 
@@ -1671,37 +2405,359 @@ advice, an official VA mapping, a rating prediction, proof of service connection
 recommendation about what to claim. Confirm every item against the source record."""
 
 
-def _handoff_dc_line(run, row):
-    """The honest Potential-DC status line for one diagnosis row, or "" when none applies.
+# The ORDINARY refusal: the reference is fine and simply has no row for this code. It is the
+# commonest outcome in a real record, and printing it beside every entry is what made the old
+# document unreadable - fifty-odd identical lines saying the same nothing. It is now stated ONCE
+# at the head of the section that holds those entries, and the per-row cell says what the entry
+# IS instead. Every OTHER refusal still prints per row, because "the category vote split" and
+# "the map needs patient context" send a reader somewhere different.
+HANDOFF_ORDINARY_NO_MATCH = "no mapping in the local reference"
 
-    Reuses dc_for_code and gem_bridge, so this line can NEVER say more than the report's own
-    cross-reference section says. An ambiguous vote is reported as a split, not an answer; a
-    missing reference is reported as unavailable, never papered over.
+# The reason a SNOMED concept produced no diagnostic code, in the map's own terms. A refusal
+# has to say WHICH refusal it is: "not in the map" and "the map needs patient context" send a
+# reader to two completely different next steps.
+SNOMED_NO_DC_REASON = {
+    "conditional": "none - the map needs patient context, so no target was resolved",
+    "no_classification": "none - the map cannot classify this concept with available data",
+    "absent": "none - this concept is not in the map",
+    "unavailable": "map or reference data unavailable",
+}
+
+# How wide EVERY field label in the appendix is. Sized to the longest one that can appear,
+# "Potential ICD-10-CM", because the alternative is a label like "Status/encounter" pushing its
+# own colon a column to the right of the "Code" line directly beneath it. One width, one
+# alignment, no ragged entries.
+SNOMED_FIELD_WIDTH = 19
+HANDOFF_FIELD_WIDTH = SNOMED_FIELD_WIDTH
+
+
+def _handoff_dc_facts(run, row):
+    """Everything the Potential-DC lane knows about ONE row, as data rather than as text.
+
+    One function, so the grouped summary at the top of the handoff and the evidence appendix at
+    the bottom can never disagree about what a row's research result was. Reuses dc_for_code,
+    gem_bridge and snomed_map, so neither surface can say more than the report's own
+    cross-reference section says: an ambiguous vote is a refusal, a conditional map is
+    unresolved, a missing reference is unavailable, and none of the three is ever an answer.
+
+    Returns a dict:
+        matches   [(dc, name, basis), ...] - EVERY diagnostic code this row reached. A list
+                  because a SNOMED concept with two unconditional map groups reaches two codes
+                  that apply TOGETHER; collapsing them would drop half of what the map said.
+        status    one honest line when there is no match, "" when there is
+        lines     the appendix's field lines for this row, already rendered
     """
-    ref, gem = run["ref"], run["gem"]
+    ref, gem, snomed = run["ref"], run["gem"], run.get("snomed")
     if row.get("sys") == "icd10":
         state, dc, name, basis = dc_for_code(ref, row["code"])
         if state == "mapped":
-            return f"Potential VA DC : {dc} {name}  ({basis}) [research cross-reference]"
-        if state == "ambiguous":
-            return f"Potential VA DC : {basis}"
-        if state == "unmapped":
-            return "Potential VA DC : no mapping in the local reference"
-        return "Potential VA DC : reference data unavailable"
+            return {"matches": [(dc, name, basis)], "status": "",
+                    "lines": [f"{'Potential VA DC':<{HANDOFF_FIELD_WIDTH}} : {dc} {name}  "
+                              f"({basis}) [research cross-reference]"]}
+        status = {"ambiguous": basis,
+                  "unmapped": "no mapping in the local reference"}.get(
+                      state, "reference data unavailable")
+        return {"matches": [], "status": status,
+                "lines": [f"{'Potential VA DC':<{HANDOFF_FIELD_WIDTH}} : {status}"]}
     csys = str(row.get("csys", ""))
     if csys.startswith("ICD-9"):
         state, targets, dc, name, basis = gem_bridge(gem, ref, row["code"])
         via = f" via ICD-10-CM {_gem_targets_text(targets)}" if targets else ""
         if state == "mapped":
-            return f"Potential VA DC : {dc} {name}  ({basis}{via}) [research cross-reference]"
-        if state == "ambiguous":
-            return f"Potential VA DC : none - {basis}{via}"
-        if state == "unmapped":
-            return f"Potential VA DC : none - {basis}{via}"
-        return "Potential VA DC : bridge/reference data unavailable"
+            return {"matches": [(dc, name, f"{basis}{via}")], "status": "",
+                    "lines": [f"{'Potential VA DC':<{HANDOFF_FIELD_WIDTH}} : {dc} {name}  "
+                              f"({basis}{via}) [research cross-reference]"]}
+        if state == "unavailable":
+            return {"matches": [], "status": "bridge/reference data unavailable",
+                    "lines": [f"{'Potential VA DC':<{HANDOFF_FIELD_WIDTH}} : bridge/reference data "
+                          f"unavailable"]}
+        return {"matches": [], "status": f"{basis}{via}",
+                "lines": [f"{'Potential VA DC':<{HANDOFF_FIELD_WIDTH}} : none - {basis}{via}"]}
     if csys.startswith("SNOMED"):
-        return "Potential VA DC : not looked up (no local SNOMED CT mapping ships with this tool)"
-    return ""
+        state, findings, _advice = snomed_map(snomed, ref, row["code"])
+        kind = snomed_type_name(snomed, row["code"])
+        targets = ", ".join(f["target"] for f in findings)
+        if state in ("direct", "multi_group"):
+            shown = targets or "none"
+        elif state == "conditional":
+            shown = f"{targets} (candidates, not resolved)" if targets else "none"
+        elif state == "unavailable":
+            shown = "not available"
+        else:
+            shown = "none"
+        matches, answers = [], []
+        for item in findings:
+            if item["dc_state"] == "mapped":
+                matches.append((item["dc"], item["name"],
+                                f"{item['basis']} via ICD-10-CM {item['target']}"))
+                answers.append(f"{item['target']} -> {item['dc']} {item['name']} "
+                               f"({item['basis']})")
+            elif item["dc_state"] == "ambiguous":
+                answers.append(f"{item['target']} -> {item['basis']}")
+            elif item["dc_state"] == "unmapped":
+                answers.append(f"{item['target']} -> no mapping in the local reference")
+        if answers:
+            dc_text = "; ".join(answers) + "  [research cross-reference]"
+        elif any(item["dc_state"] == "unavailable" for item in findings):
+            # The MAP answered. It is the separate Potential-DC reference that is missing, and
+            # the two are never merged into one vague excuse.
+            dc_text = "reference data unavailable"
+        else:
+            dc_text = SNOMED_NO_DC_REASON.get(state, "none")
+        lines = [
+            f"{'SNOMED concept type':<{SNOMED_FIELD_WIDTH}} : {kind}",
+            f"{'Potential ICD-10-CM':<{SNOMED_FIELD_WIDTH}} : {shown}",
+            f"{'Map basis':<{SNOMED_FIELD_WIDTH}} : {SNOMED_HANDOFF_BASIS[state]}",
+        ]
+        # THE LINE IS OMITTED, NOT SET TO "none". Owner ruling, 2026-08-24: a
+        # `Potential VA DC : none` under a procedure still tells a reader the procedure was
+        # weighed as a possible diagnosis and came up short, which is not what happened. It was
+        # never eligible. The terminology above says what it is; the silence says the rest.
+        eligible = snomed_is_diagnosis(snomed, row["code"])
+        if eligible:
+            lines.append(f"{'Potential VA DC':<{SNOMED_FIELD_WIDTH}} : {dc_text}")
+        return {"matches": matches if eligible else [],
+                "status": "" if (eligible and matches) else (dc_text if eligible else ""),
+                "lines": lines}
+    return {"matches": [], "status": "", "lines": []}
+
+
+def _handoff_dc_lines(run, row):
+    """The appendix's Potential-DC field lines for one row."""
+    return _handoff_dc_facts(run, row)["lines"]
+
+
+# ---- how a handoff entry is sorted into a section --------------------------
+# A CLAIM WORKER SHOULD NOT HAVE TO READ 191 PAGES TO FIND THE USEFUL PART, and should never be
+# handed a laboratory order under the word "Diagnosis". So every retained row is placed in
+# exactly one section, by a rule that can be stated in a sentence and reproduced by hand. There
+# is no clustering, no similarity, no inference: a row is grouped with another only because the
+# EXISTING research reference returned the same diagnostic code for both.
+#
+# Nothing is deleted. A row that is not presented as a diagnosis still appears in its section
+# above and again, in full, in the source-page appendix.
+HANDOFF_ADMIN = "admin"
+HANDOFF_PROCEDURE = "procedure"
+HANDOFF_VERIFY = "verify"
+HANDOFF_MATCH = "match"
+HANDOFF_OTHER = "other"
+
+# An ICD-10 Z-code is "factors influencing health status and contact with health services":
+# an encounter, a screening, a status, an immunization, a long-term drug therapy. It is a real
+# ICD-10 code and it is not a diagnosis of a disease, so it is separated rather than listed
+# beside one. Matched on the extracted code as written, which always starts with its letter.
+HANDOFF_Z_RE = re.compile(r'^Z', re.I)
+
+# An ICD-10 R-code is "symptoms, signs and abnormal clinical and laboratory findings, not
+# elsewhere classified". Snoring, chest pain and dizziness are things the record OBSERVED, not
+# diseases a clinician diagnosed, and calling them diagnoses on a claim organizer is the same
+# error the SNOMED type work exists to fix one code system over. The label changes; the entry,
+# its code and its research result do not, and an R-code that the reference DID answer for
+# still appears under its diagnostic code so nothing is hidden by the rename.
+HANDOFF_R_RE = re.compile(r'^R', re.I)
+HANDOFF_R_LABEL = "Finding/symptom"
+
+# A laboratory ORDER named in a record, not a diagnosis. Two real examples from a veteran's
+# records, both of which the handoff used to label "Diagnosis":
+#     HGB A1C (Tosoh G8) (83036) Ordered
+#     MICROALBUMIN URINE QUANT (82043) Ordered
+# The rule is deliberately NARROW and needs BOTH halves of the evidence the record itself
+# printed: a parenthesised 5-digit procedure-code-shaped number AND a trailing order/result
+# status word. A looser rule would start quarantining real diagnoses that happen to carry a
+# number, and the cost of that is worse than the cost of leaving one lab order in place.
+#
+# This changes NOTHING about extraction. The row is still found, still reported, still in the
+# appendix. It is placed under "entries to verify" with the reason printed, so a reader can
+# disagree with this rule in one second by looking at the source page.
+HANDOFF_ORDER_RE = re.compile(r'\(\d{5}\)')
+HANDOFF_ORDER_WORDS = ("ordered", "order", "collected", "resulted", "pending", "specimen")
+HANDOFF_ORDER_REASON = "appears to be an ordered laboratory test"
+HANDOFF_UNTYPED_REASON = "type not established from the record"
+HANDOFF_SNOMED_UNTYPED_REASON = "the licensed release does not type this concept"
+
+
+def _handoff_looks_like_an_order(desc):
+    """True only for a named entry the record itself wrote as a laboratory order."""
+    text = str(desc).strip()
+    if not HANDOFF_ORDER_RE.search(text):
+        return False
+    tail = re.sub(r'[^a-z ]', ' ', text.lower()).split()
+    return bool(tail) and tail[-1] in HANDOFF_ORDER_WORDS
+
+
+def _handoff_place(run, row, facts):
+    """(section, label, reason) for one row. The only place this decision is made."""
+    snomed = run.get("snomed")
+    csys = str(row.get("csys", ""))
+    code = row.get("code", "-")
+    if row.get("sys") == "icd10" and HANDOFF_Z_RE.match(code):
+        return HANDOFF_ADMIN, "Status/encounter", ""
+    if row.get("sys") == "icd10" and HANDOFF_R_RE.match(code):
+        return (HANDOFF_MATCH if facts["matches"] else HANDOFF_OTHER), HANDOFF_R_LABEL, ""
+    if code == "-" or not row.get("csys") and row.get("sys") != "icd10":
+        if _handoff_looks_like_an_order(row.get("desc", "")):
+            return HANDOFF_VERIFY, "Test order", HANDOFF_ORDER_REASON
+        return HANDOFF_VERIFY, "Clinical entry", HANDOFF_UNTYPED_REASON
+    if csys.startswith("SNOMED"):
+        tag = snomed_type(snomed, code)
+        label = SNOMED_HANDOFF_TYPE_LABEL.get(tag, SNOMED_HANDOFF_TYPE_DEFAULT)
+        if not tag:
+            # FAIL CLOSED. An untyped concept is not assumed to be a diagnosis, and it is not
+            # filed under "procedures and events" either, because neither is known to be true.
+            return HANDOFF_VERIFY, label, HANDOFF_SNOMED_UNTYPED_REASON
+        if tag != SNOMED_DIAGNOSIS_TAG and tag != "finding":
+            return HANDOFF_PROCEDURE, label, ""
+        return (HANDOFF_MATCH if facts["matches"] else HANDOFF_OTHER), label, ""
+    return (HANDOFF_MATCH if facts["matches"] else HANDOFF_OTHER), "Diagnosis", ""
+
+
+def _handoff_split_repeat(desc):
+    """("Type 2 diabetes", "x85") out of "Type 2 diabetes  (x85)"."""
+    m = re.search(r'\s*\(x(\d+)\)\s*$', str(desc))
+    if not m:
+        return str(desc).strip(), ""
+    return str(desc)[:m.start()].strip(), f"x{m.group(1)}"
+
+
+def _handoff_entries(run):
+    """Every retained row of the run, with its section, its research result and its source.
+
+    Built ONCE and used by all five sections, so a row cannot be summarized one way at the top
+    and evidenced another way at the bottom, and so the counts reconcile by construction rather
+    than by a second pass that could drift.
+    """
+    # The handoff is a FINAL-RESULT surface, so the same consolidation applies as the report's
+    # paste block: a bare parent whose specific child was extracted anywhere in the run is
+    # omitted here, while the page rows of the report keep it as source evidence.
+    all_icd10 = [r["code"] for f in run["files"] for r in f["rows"] if r.get("sys") == "icd10"]
+    keep = set(consolidate_codes(all_icd10))
+
+    entries = []
+    for n, f in enumerate(run["files"]):
+        alias = f"F{n + 1}"
+        if f["error"] or not f["rows"]:
+            continue
+        for r in f["rows"]:
+            if r.get("sys") == "icd10" and r["code"] not in keep:
+                continue
+            info = f["pages"].get(r["loc"]) or f["default"]
+            facts = _handoff_dc_facts(run, r)
+            section, label, reason = _handoff_place(run, r, facts)
+            desc, repeat = _handoff_split_repeat(
+                re.sub(r'\s*\[[^\]]+\]\s*$', '', r["desc"]) if r.get("csys") else r["desc"])
+            loc = r["loc"]
+            docpage = info.get("docpage", "")
+            source = f"{alias} {loc}"
+            # p5/d2 is "extracted page 5, the page the document numbers 2". The two differ
+            # whenever a record has a cover sheet, and citing the wrong one sends whoever
+            # checks this to the wrong page. Only added when the location IS a page: a text
+            # file's "line 7" is not page 5 of anything, and "line 7/d5" would say it was.
+            if docpage and f["grain"] == "page":
+                source += f"/d{str(docpage).split(' of ')[0]}"
+            entries.append({
+                "alias": alias, "file": f, "loc": loc, "docpage": docpage,
+                "reviewer": info.get("reviewer", ""), "reviewed": info.get("reviewed", ""),
+                "code": r["code"], "sys": r.get("sys", ""), "csys": str(r.get("csys", "")),
+                "desc": desc, "repeat": repeat, "date": r["date"], "ocr": bool(r.get("ocr")),
+                "row": r, "facts": facts, "section": section, "label": label,
+                "reason": reason, "source": source,
+            })
+    return entries
+
+
+def _handoff_width(values, low, high):
+    """A column exactly as wide as its widest value, within limits.
+
+    Derived from the data rather than fixed, so a document of plain ICD-10 codes does not carry
+    ten blank columns reserved for an 18-digit SNOMED identifier that never appears, and a
+    document that does carry one does not have its columns collide.
+    """
+    return max(low, min(high, max((len(str(v)) for v in values), default=low)))
+
+
+def _handoff_table(rows, headings, widths, indent="   "):
+    """A plain-text table whose long cells WRAP onto an indented continuation line.
+
+    Truncation is not an option here: the cell that overflows is the clinical entry's own name,
+    and half a diagnosis is a different diagnosis.
+    """
+    out = [indent + " ".join(h[:w].ljust(w) for h, w in zip(headings, widths)).rstrip(),
+           indent + " ".join("-" * w for w in widths)]
+    for cells in rows:
+        cells = [str(c) for c in cells]
+        first, rest = [], []
+        for cell, w in zip(cells, widths):
+            if len(cell) <= w:
+                first.append(cell.ljust(w))
+                rest.append("")
+                continue
+            cut = cell.rfind(" ", 0, w + 1)
+            cut = cut if cut > w // 2 else w
+            first.append(cell[:cut].ljust(w))
+            rest.append(cell[cut:].strip())
+        out.append(indent + " ".join(first).rstrip())
+        while any(rest):
+            line, nxt = [], []
+            for cell, w in zip(rest, widths):
+                if len(cell) <= w:
+                    line.append(cell.ljust(w))
+                    nxt.append("")
+                    continue
+                cut = cell.rfind(" ", 0, w + 1)
+                cut = cut if cut > w // 2 else w
+                line.append(cell[:cut].ljust(w))
+                nxt.append(cell[cut:].strip())
+            out.append(indent + " ".join(line).rstrip())
+            rest = nxt
+    return out
+
+
+def _handoff_date(entry):
+    """A date, marked once as approximate rather than explained on every row."""
+    return f"{entry['date']}*" if entry["date"] else "-"
+
+
+def _handoff_entry_rows(entries, extra=None):
+    """The shared CODE / CLINICAL ENTRY / DATE / SOURCE / SEEN table."""
+    heads = ["CODE", "CLINICAL ENTRY", "DATE", "SOURCE"]
+    cells = [[e["code"], e["desc"] + ("  (OCR)" if e["ocr"] else ""),
+              _handoff_date(e), e["source"]] for e in entries]
+    widths = [_handoff_width([c[0] for c in cells], 8, 18),
+              _handoff_width([c[1] for c in cells], 20, 46),
+              _handoff_width([c[2] for c in cells], 10, 12),
+              _handoff_width([c[3] for c in cells], 8, 16)]
+    # SEEN only exists when duplicates were collapsed. A column of dashes is five characters of
+    # width spent telling a reader nothing, on every row.
+    if any(e["repeat"] for e in entries):
+        heads.append("SEEN")
+        for cell, e in zip(cells, entries):
+            cell.append(e["repeat"] or "-")
+        widths.append(_handoff_width([c[-1] for c in cells], 4, 6))
+    if extra:
+        heads.append(extra[0])
+        for cell, e in zip(cells, entries):
+            cell.append(extra[1](e))
+        widths.append(_handoff_width([c[-1] for c in cells], 8, 34))
+    return _handoff_table(cells, heads, widths)
+
+
+def _handoff_sort(entries):
+    """Clinical entry name, then code, then source. Deterministic and explainable."""
+    return sorted(entries, key=lambda e: (e["desc"].lower(), e["code"], e["source"]))
+
+
+def _handoff_dc_groups(entries):
+    """{(dc, name): [entry, ...]} for every entry that reached a diagnostic code.
+
+    An entry appears in EVERY group it reached. A SNOMED concept with two unconditional map
+    groups reaches two diagnostic codes that apply together, and filing it under only one of
+    them would quietly drop the other half of the map's answer.
+    """
+    groups = {}
+    for e in entries:
+        for dc, name, basis in e["facts"]["matches"]:
+            groups.setdefault((dc, name), []).append((e, basis))
+    return groups
 
 
 def claim_handoff_text(run=None):
@@ -1710,13 +2766,31 @@ def claim_handoff_text(run=None):
     ORGANIZES ONLY. Every field below was already collected during extraction; nothing is
     rescanned, inferred, or added. Raises ValueError when no completed extraction exists, so
     the caller can say so instead of writing an empty file.
+
+    Five sections, in the order a person actually needs them: the run summary and the source
+    legend; the research matches grouped by diagnostic code; the coded entries the local
+    reference had no answer for; the entries that are not diagnoses and should never have been
+    presented as ones; and the complete page-by-page evidence as an appendix. The evidence did
+    not shrink. It stopped being the first thing anyone had to read.
     """
     run = run or LAST_RUN
     if not run:
         raise ValueError("No completed extraction to organize - run an extraction first.")
 
+    entries = _handoff_entries(run)
+    by_section = {}
+    for e in entries:
+        by_section.setdefault(e["section"], []).append(e)
+    matched = by_section.get(HANDOFF_MATCH, [])
+    other = by_section.get(HANDOFF_OTHER, [])
+    flagged = (by_section.get(HANDOFF_ADMIN, []) + by_section.get(HANDOFF_PROCEDURE, [])
+               + by_section.get(HANDOFF_VERIFY, []))
+    nameless = [e for e in entries if e["code"] == "-"]
+
     out = []
-    out.append("CLAIM FILE HANDOFF - references organized from one extraction run")
+
+    # ---- 1. run summary and source legend ---------------------------------------------------
+    out.append("CLAIM FILE HANDOFF")
     out.append("=" * 78)
     out.append(HANDOFF_BOUNDARY)
     out.append("")
@@ -1724,75 +2798,197 @@ def claim_handoff_text(run=None):
     out.append(f"When:    {run['when']}")
     out.append(f"Report:  {run['output']}")
     if run.get("unique"):
-        out.append("Options: duplicate diagnoses were collapsed (the (xN) counts show repeats).")
+        out.append("Options: duplicate entries were collapsed (the SEEN counts show repeats).")
     if run.get("stopped"):
         out.append("STOPPED EARLY - this run was stopped by the user, so this is a PARTIAL")
         out.append("organization of a partial scan, NOT a complete review of the records.")
+    out.append("")
+    out.append("1. RUN SUMMARY")
+    label_w = 36
+    for text, n in [("Files reviewed", len(run["files"])),
+                    ("Clinical record entries retained", len(entries))]:
+        out.append(f"{text + ':':<{label_w}}{n}")
+    for text, n in [("Potential VA DC research matches", len(matched)),
+                    ("Other coded clinical entries", len(other)),
+                    ("Entries flagged for review", len(flagged))]:
+        out.append(f"  {text + ':':<{label_w - 2}}{n}")
+    out.append(f"    {'of those, named with no code:':<{label_w - 4}}{len(nameless)}")
+    out.append("The three indented counts add up to the entries retained. The fourth is a")
+    out.append("subset of the entries flagged for review, not a fifth pile.")
+    out.append("")
+    out.append("SOURCE FILES")
+    for n, f in enumerate(run["files"]):
+        line = f"F{n + 1} = {f['path']}"
+        if f["error"]:
+            line += f"   (could not read: {f['error']})"
+        out.append(line)
+    out.append("")
+    out.append("HOW TO READ THIS")
+    out.append("SOURCE  F1 p5/d2 means source file F1, extracted page 5, the page the document")
+    out.append("        itself numbers 2. Without /d the document printed no page number.")
+    out.append("DATE    a trailing * means APPROXIMATE: the nearest date on that page, which is")
+    out.append("        not necessarily the date of the entry. Confirm against the record.")
+    out.append("SEEN    how many times the entry appeared. Shown only when duplicates were")
+    out.append("        collapsed for this run.")
 
-    # The handoff is a FINAL-RESULT surface, so the same consolidation applies: a bare parent
-    # whose specific child was extracted anywhere in the run is omitted here, while the page
-    # rows of the report keep it as source evidence. Only extracted ICD-10 rows participate.
-    all_icd10 = [r["code"] for f in run["files"] for r in f["rows"]
-                 if r.get("sys") == "icd10"]
-    keep = set(consolidate_codes(all_icd10))
-
-    n_rows = 0
-    for f in run["files"]:
+    # ---- 2. potential VA diagnostic-code research matches ------------------------------------
+    out.append("")
+    out.append("=" * 78)
+    out.append("2. POTENTIAL VA DIAGNOSTIC-CODE RESEARCH MATCHES")
+    out.append("=" * 78)
+    out.append("A LOCAL RESEARCH CROSS-REFERENCE ONLY. Not an official VA crosswalk, not a")
+    out.append("rating, not an entitlement decision, and not advice about what to claim.")
+    out.append("Verify every group against 38 CFR Part 4 and the source record.")
+    out.append("")
+    out.append("Entries are grouped because the reference returned the SAME diagnostic code for")
+    out.append("them, not because this document says they are the same condition. Every source")
+    out.append("code and description is kept as the record wrote it. One entry can appear in")
+    out.append("two groups when the map gives two codes that apply together.")
+    groups = _handoff_dc_groups(entries)
+    if not groups:
         out.append("")
-        out.append("=" * 78)
-        out.append(f"SOURCE FILE: {f['path']}")
+        out.append("   (no entry in this run reached a diagnostic code in the local reference)")
+    for dc, name in sorted(groups, key=lambda k: (0, int(k[0]), k[1])
+                           if str(k[0]).isdigit() else (1, 0, k[1])):
+        members = groups[(dc, name)]
+        bases = {basis for _e, basis in members}
+        out.append("")
+        out.append(f"POTENTIAL DC {dc} - {name}")
+        if len(bases) == 1:
+            out.append(f"   basis: {bases.pop()}")
+        out.append("")
+        ordered = _handoff_sort([e for e, _b in members])
+        basis_of = {id(e): b for e, b in members}
+        extra = None if len(bases) <= 1 else ("BASIS", lambda e: basis_of[id(e)])
+        out.extend(_handoff_entry_rows(ordered, extra))
+
+    # ---- 3. coded entries with no local diagnostic-code result -------------------------------
+    out.append("")
+    out.append("=" * 78)
+    out.append("3. OTHER DIAGNOSES AND FINDINGS WITH NO LOCAL VA DC MATCH")
+    out.append("=" * 78)
+    out.append("The local research reference has no VA diagnostic-code result for the entries")
+    out.append("below. That does not determine whether an entry matters to a claim. It is said")
+    out.append("once here rather than repeated beside every row.")
+    out.append("")
+    out.append("Each entry keeps its own code system and type. They are not all diagnoses: the")
+    out.append("TYPE column says what each one is, and only a disorder is called a diagnosis.")
+    if not other:
+        out.append("")
+        out.append("   (none)")
+    else:
+        out.append("")
+        out.extend(_handoff_entry_rows(_handoff_sort(other),
+                                       ("TYPE / REASON", lambda e: _handoff_kind(e))))
+
+    # ---- 4. administrative, procedural, and entries to verify --------------------------------
+    out.append("")
+    out.append("=" * 78)
+    out.append("4. ADMINISTRATIVE, PROCEDURAL, AND ENTRIES TO VERIFY")
+    out.append("=" * 78)
+    out.append("These are NOT presented as diagnoses. Nothing here was deleted: every one of")
+    out.append("them appears again, in full, in the source-page appendix below.")
+    for title, key, note in [
+            ("ADMINISTRATIVE OR STATUS CODES", HANDOFF_ADMIN,
+             "ICD-10 Z-codes: encounters, screening, status, immunization, long-term therapy."),
+            ("PROCEDURES AND EVENTS", HANDOFF_PROCEDURE,
+             "SNOMED CT concepts the licensed release types as something other than a "
+             "disorder."),
+            ("NAMED ENTRIES TO VERIFY", HANDOFF_VERIFY,
+             "The record named these without enough to establish what they are.")]:
+        rows = by_section.get(key, [])
+        out.append("")
+        out.append(title)
+        out.append(f"   {note}")
+        if not rows:
+            out.append("")
+            out.append("   (none)")
+            continue
+        out.append("")
+        out.extend(_handoff_entry_rows(_handoff_sort(rows),
+                                       ("TYPE / REASON", lambda e: _handoff_kind(e))))
+
+    # ---- 5. the detailed source-page appendix ------------------------------------------------
+    out.append("")
+    out.append("=" * 78)
+    out.append("5. DETAILED SOURCE-PAGE INDEX")
+    out.append("=" * 78)
+    out.append("The complete evidence trail, in the order the records were read. Every retained")
+    out.append("entry above appears here exactly once, with its page and its full research")
+    out.append("status. An entry with NO 'Potential VA DC' line is one the local reference")
+    out.append("simply has no row for. That is said here once instead of under every entry.")
+    for n, f in enumerate(run["files"]):
+        alias = f"F{n + 1}"
+        out.append("")
+        out.append("-" * 78)
+        out.append(f"{alias} - {f['path']}")
         if f["error"]:
             out.append(f"   could not read: {f['error']}")
             continue
-        if not f["rows"]:
+        rows = [e for e in entries if e["file"] is f]
+        if not rows:
             out.append("   (no ICD-10 codes or named diagnoses found)")
             continue
         current = object()
-        for r in f["rows"]:
-            if r.get("sys") == "icd10" and r["code"] not in keep:
-                continue                     # a parent consolidated away by its own child
-            group = r["loc"] if f["grain"] == "page" else "(whole file)"
+        for e in rows:
+            group = e["loc"] if f["grain"] == "page" else "(whole file)"
             if group != current:
                 current = group
-                info = f["pages"].get(r["loc"]) or f["default"]
                 head = f"--- {group}"
-                if info.get("docpage"):
-                    head += f"   |   document page {info['docpage']}"
+                if e["docpage"]:
+                    head += f"   |   document page {e['docpage']}"
                 head += " ---"
                 out.append("")
                 out.append(head)
-                who = info.get("reviewer", "")
-                when = info.get("reviewed", "")
-                if who or when:
-                    out.append(f"Provider/reviewer : {who or '(name not given)'}"
-                               + (f"  (reviewed {when})" if when else ""))
-            n_rows += 1
-            desc = r["desc"]
-            if r.get("sys") == "icd10":
-                code_line = f"{r['code']} (ICD-10-CM)"
-            elif r.get("csys"):
-                code_line = f"{r['code']} [{r['csys']}] - NOT an ICD-10 code"
-                desc = re.sub(r'\s*\[[^\]]+\]\s*$', '', desc)
+                if e["reviewer"] or e["reviewed"]:
+                    out.append(f"{'Provider/reviewer':<{HANDOFF_FIELD_WIDTH}} : "
+                               f"{e['reviewer'] or '(name not given)'}"
+                               + (f"  (reviewed {e['reviewed']})" if e["reviewed"] else ""))
+            out.append("")
+            desc = e["desc"] + (f"  ({e['repeat']})" if e["repeat"] else "")
+            out.append(f"{e['label']:<{HANDOFF_FIELD_WIDTH}} : {desc}"
+                       + ("  (OCR - confirm against the source)" if e["ocr"] else ""))
+            if e["sys"] == "icd10":
+                code_line = f"{e['code']} (ICD-10-CM)"
+            elif e["csys"]:
+                code_line = f"{e['code']} [{e['csys']}] - NOT an ICD-10 code"
             else:
                 code_line = "(named in the record with no code)"
-            out.append("")
-            out.append(f"Diagnosis : {desc}" + ("  (OCR - confirm against the source)"
-                                                if r.get("ocr") else ""))
-            out.append(f"Code      : {code_line}")
-            where = r["loc"] if f["grain"] != "page" else group
-            out.append(f"Where     : {os.path.basename(f['path'])}, {where}")
-            date = r["date"] or "(none found near this entry)"
-            out.append(f"Date      : {date}  (APPROXIMATE - nearest date on the page)"
-                       if r["date"] else f"Date      : {date}")
-            dc_line = _handoff_dc_line(run, r)
-            if dc_line:
-                out.append(dc_line)
+            out.append(f"{'Code':<{HANDOFF_FIELD_WIDTH}} : {code_line}")
+            out.append(f"{'Where':<{HANDOFF_FIELD_WIDTH}} : {e['source']}")
+            date = e["date"] or "(none found near this entry)"
+            out.append(f"{'Date':<{HANDOFF_FIELD_WIDTH}} : {date}*" if e["date"]
+                       else f"{'Date':<{HANDOFF_FIELD_WIDTH}} : {date}")
+            if e["reason"]:
+                out.append(f"{'Note':<{HANDOFF_FIELD_WIDTH}} : {e['reason']}")
+            # The ordinary refusal is the convention stated at the head of this appendix, not a
+            # line repeated under every entry that has it. Every other status still prints.
+            out.extend(ln for ln in e["facts"]["lines"]
+                       if not ln.endswith(f": {HANDOFF_ORDINARY_NO_MATCH}"))
 
     out.append("")
     out.append("=" * 78)
-    out.append(f"{n_rows} diagnosis reference(s) across {len(run['files'])} file(s), organized")
+    out.append(f"{len(entries)} clinical record entry reference(s) across "
+               f"{len(run['files'])} file(s), organized")
     out.append("from the report named above. Nothing here is advice about what to claim.")
     return "\n".join(out) + "\n"
+
+def _handoff_kind(entry):
+    """The short TYPE / REASON cell: what the entry is, or why it needs a look."""
+    if entry["reason"]:
+        return entry["reason"]
+    status = entry["facts"]["status"]
+    if status == HANDOFF_ORDINARY_NO_MATCH:
+        status = ""                      # said once, at the head of the section
+    if entry["csys"].startswith("SNOMED"):
+        kind = f"SNOMED {entry['label'].lower()}"
+        why = re.sub(r'^none - ', '', status)
+        return f"{kind}, {why}" if why else kind
+    if entry["csys"].startswith("ICD-9"):
+        return f"ICD-9-CM, {status}" if status else "ICD-9-CM"
+    if entry["section"] == HANDOFF_ADMIN:
+        return "ICD-10 status or encounter code"
+    return status or f"ICD-10 {entry['label'].lower()}"
 
 
 def codes_from_report(report):
@@ -1838,6 +3034,24 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     # icd10_codes on purpose: these must never reach the paste block, which feeds an outside
     # ICD-10 lookup that would answer for them confidently and wrongly.
     icd9_codes = []
+    # The same, for codes the record labeled SNOMED CT. Kept in its own list for the same
+    # reason, and because the two lanes cross their codes through different maps under
+    # different rules.
+    snomed_codes = []
+
+    # Loaded ONCE, on the first SNOMED row that needs it, and reused for the rest of the run.
+    # It has to be available while the diagnosis rows are still being written, because those
+    # rows carry the concept's TYPE - `[SNOMED CT procedure]` - and a type worked out after the
+    # rows were printed would arrive too late to appear on them. A records set with no SNOMED
+    # coding never touches it, which is what the laziness is for: the map is ~48 MB once
+    # decompressed and nobody should pay for it to be told there was nothing to look up.
+    _snomed_box = []
+
+    def get_snomed():
+        if not _snomed_box:
+            _snomed_box.append(load_snomed_reference(base))
+        return _snomed_box[0]
+
     lines = []
     lines.append(REPORT_BANNER)
     lines.append(f"Scanned: {target}")
@@ -1913,7 +3127,7 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
             if group != current:
                 current = group
                 info = page_meta.get(r["loc"]) or default_meta
-                head = f"   {group}" if grain == "page" else "   diagnoses found"
+                head = f"   {group}" if grain == "page" else "   clinical entries found"
                 if info.get("docpage"):
                     head += f"   |   document page {info['docpage']}"
                 lines.append("")
@@ -1930,18 +3144,33 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
                 lines.append("      " + "-" * 70)
             tag = "  (OCR)" if r.get("ocr") else ""
             where = "" if grain == "page" else f"{r['loc']:<10} "
-            lines.append(f"      {where}{r['code']:<12} {(r['date'] or '-'):<12} {r['desc']}{tag}")
+            desc = r["desc"]
+            # The row keeps the record's own description and its own code; only the SYSTEM tag
+            # grows a word, so a reader sees at a glance that 80146002 is a procedure. The
+            # stored row is left alone - `csys` stays the lane name, and the claim handoff
+            # builds its own label from the type index rather than re-reading display text.
+            if str(r.get("csys", "")).startswith("SNOMED"):
+                desc = desc.replace("[SNOMED CT]",
+                                    f"[{snomed_row_tag(get_snomed(), r['code'])}]", 1)
+            lines.append(f"      {where}{r['code']:<12} {(r['date'] or '-'):<12} {desc}{tag}")
             total += 1
             if r.get("sys") == "icd10" and r["code"] not in icd10_codes:
                 icd10_codes.append(r["code"])
-            # Only a row the record labeled ICD-9 may be bridged. SNOMED rows carry the same
-            # "other" system marker and are deliberately left out: nothing local maps them.
+            # Only a row the record LABELED may be crossed, and each label goes to its own map:
+            # ICD-9 through the GEM, SNOMED CT through the licensed US map. An unlabeled number
+            # reaches neither, which is the whole point of keeping `csys` as its own field.
             elif str(r.get("csys", "")).startswith("ICD-9") and r["code"] not in icd9_codes:
                 icd9_codes.append(r["code"])
+            elif str(r.get("csys", "")).startswith("SNOMED") and r["code"] not in snomed_codes:
+                snomed_codes.append(r["code"])
 
     lines.append("")
     lines.append("=" * 78)
-    lines.append(f"{total} diagnosis line(s) across {len(files)} file(s).")
+    # NOT "diagnosis line(s)". This total counts every row the run produced, and those rows are
+    # a mix: ICD-10 diagnoses, diagnoses named with no code, and SNOMED concepts that may be
+    # procedures, events or findings. Calling the whole mixed pile diagnoses is the same error
+    # the SNOMED type work exists to fix, one line further down the page.
+    lines.append(f"{total} clinical record entry line(s) across {len(files)} file(s).")
     if stopped:
         lines.append("STOPPED EARLY - partial results, NOT a complete scan of the target.")
     if ocr_needed:
@@ -1953,20 +3182,32 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     # from the CODES_HEADING line to the end of the file, so anything added underneath would be
     # handed to whoever pressed Copy as if it were an ICD-10 code.
     final_codes = consolidate_codes(icd10_codes)
-    ref = load_dc_reference(base) if (final_codes or icd9_codes) else None
+    ref = load_dc_reference(base) if (final_codes or icd9_codes or snomed_codes) else None
     gem = load_gem_reference(base) if icd9_codes else None
+    # Already loaded by the row loop if there was a SNOMED row to type; this reuses that one
+    # load rather than reading and re-validating the same 48 MB a second time.
+    snomed = get_snomed() if snomed_codes else None
     LAST_RUN = {
         "target": target, "output": output,
         "when": f"{datetime.datetime.now():%Y-%m-%d %H:%M}",
         "stopped": stopped, "unique": unique,
-        "files": captured, "ref": ref, "gem": gem,
+        "files": captured, "ref": ref, "gem": gem, "snomed": snomed,
     }
     lines.extend(dc_section(sorted(final_codes), ref,
                             f" ({DC_REF_NAME} is missing, damaged, or not vouched for by "
                             f"{DC_MANIFEST_NAME})",
                             icd9_found=sorted(icd9_codes), gem=gem,
                             gem_missing_reason=f" ({GEM_REF_NAME} is missing, damaged, or not "
-                                               f"vouched for by {GEM_MANIFEST_NAME})"))
+                                               f"vouched for by {GEM_MANIFEST_NAME})",
+                            snomed_found=sorted(snomed_codes), snomed=snomed,
+                            snomed_missing_reason=f" ({SNOMED_REF_NAME} is missing, damaged, or "
+                                                  f"not vouched for by "
+                                                  f"{SNOMED_MANIFEST_NAME})"))
+    if snomed_codes:
+        lines.extend(snomed_terminology_section(
+            sorted(snomed_codes), snomed,
+            f" ({SNOMED_REF_NAME} is missing, damaged, or not vouched for by "
+            f"{SNOMED_MANIFEST_NAME})"))
 
     # The bare code list goes LAST so it is easy to select, and so codes_from_report can simply
     # read to the end of the file.
@@ -1982,7 +3223,7 @@ def run_extraction(target, output, no_ocr=False, unique=False, progress=None, sh
     report = "\n".join(lines)
     with open(output, "w", encoding="utf-8") as f:
         f.write(report + "\n")
-    _emit(f"Done - {total} diagnosis line(s). Report saved.")
+    _emit(f"Done - {total} clinical record entry line(s). Report saved.")
     return report
 
 

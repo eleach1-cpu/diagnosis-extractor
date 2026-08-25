@@ -16,13 +16,18 @@ Files
                     builds icd9_gem_reference.json, the optional bridge from the
                     ICD-9-CM codes a record LABELS as such through to that same
                     cross-reference (see below)
+  build_snomed_icd10cm_reference.py
+                    builds snomed_icd10cm_reference.json.gz, the optional map from
+                    the SNOMED CT codes a record LABELS as such through to that
+                    same cross-reference (see below)
 
   No new packaging step: PyInstaller follows the imports, so icd_theme.py and
-  icd_disclaimer.py are picked up by the same command below. Both build_ scripts
-  are build-time tools and are NOT imported by the program, so neither is bundled.
-  build_icd9_gem_reference.py does import icd_extract, but only to borrow the
-  reader's own floor, code shapes and lookup, so the artifact it writes cannot
-  drift from the rules the program will apply to it.
+  icd_disclaimer.py are picked up by the same command below. The build_ scripts
+  are build-time tools and are NOT imported by the program, so none is bundled.
+  build_icd9_gem_reference.py and build_snomed_icd10cm_reference.py do import
+  icd_extract, but only to borrow the reader's own floor, code shapes, classifier
+  and lookup, so the artifacts they write cannot drift from the rules the program
+  will apply to them.
 
 One-time setup (Python 3.11+):
   pip install pymupdf python-docx beautifulsoup4 rapidocr-onnxruntime pillow pyinstaller
@@ -192,10 +197,173 @@ twice over:
 
   Only codes the record LABELS ICD-9 or ICD-9-CM, or a CDA element carrying the
   ICD-9-CM OID, are ever bridged. No new detection was added and no bare number is
-  read as an ICD-9 code. SNOMED CT rows are reported but never bridged: no local
-  SNOMED mapping ships with this program.
+  read as an ICD-9 code. SNOMED CT rows never go through the GEM; they have their
+  own map, their own rules and their own block (see below).
 
   A bridged ICD-10-CM target never replaces the ICD-9 code in a diagnosis row and
   never enters the final ICD-10 CODES block. That block is pasted into an outside
   ICD-10 lookup, which would answer for a silently converted code confidently and
   wrongly.
+
+Rebuild the SNOMED CT to ICD-10-CM map (optional, only when a new US Edition ships):
+
+  python build_snomed_icd10cm_reference.py --zip <path to the US Edition ZIP> ^
+    --out <folder>
+
+  or, when the two RF2 files have already been extracted somewhere:
+
+  python build_snomed_icd10cm_reference.py --rf2 <path to
+    der2_iisssccRefset_ExtendedMapSnapshot_US1000124_<YYYYMMDD>.txt> --desc <path
+    to sct2_Description_Snapshot-en_US1000124_<YYYYMMDD>.txt> --out <folder>
+
+  --desc is REQUIRED with --rf2. A map with no concept types cannot say whether a
+  code is a diagnosis or a procedure, and the answer to that decides whether the
+  concept is offered a VA diagnostic code at all.
+
+  There is no default path. The ZIP is read IN PLACE: the 622 MB archive is never
+  copied into the repository and neither RF2 file is ever extracted to disk. Unlike
+  the ICD-9 bridge, this builder does NOT need the DC reference: nothing about the
+  map depends on it, and every diagnostic code is looked up live at run time.
+
+  SOURCES, BOTH FROM THE SAME RELEASE OR THE BUILD FAILS:
+    Snapshot/Refset/Map/der2_iisssccRefset_ExtendedMapSnapshot_*.txt
+      the "ICD-10-CM complex map reference set", refset 6011000124106, ACTIVE
+      ROWS ONLY
+    Snapshot/Terminology/sct2_Description_Snapshot-en_*.txt
+      the ACTIVE fully specified names, typeId 900000000000003001, read only for
+      the semantic tag of each concept
+  Built and verified against the March 2026 release, effectiveTime 20260301.
+
+  The same file also carries refset 447562003, the INTERNATIONAL SNOMED CT to
+  ICD-10 map. It is excluded and the exclusion is counted in the manifest. Its
+  targets are ICD-10, not ICD-10-CM, and this lane ends at an ICD-10-CM lookup, so
+  mixing them would put the wrong code system in front of a veteran.
+
+  It writes two files:
+    snomed_icd10cm_reference.json.gz       the data the program reads, gzip
+    snomed_icd10cm_reference.manifest.json the detached build record
+
+  About 6.7 MB compressed and 61 MB uncompressed, so roughly 7 MB of download and
+  installed size. The program reads it STRAIGHT OUT OF GZIP on every load and
+  never writes an expanded copy beside itself. It is loaded only when a report
+  actually holds a SNOMED CT row, so a records set with no SNOMED coding pays
+  nothing for it at all.
+
+  Checking a build:
+    - artifact SHA-256 matches snomed_icd10cm_reference.manifest.json. The hash is
+      over the COMPRESSED bytes, because the .json.gz is what sits on disk
+    - source.release_date matches the release you built from, and the builder
+      already refused to proceed if the ZIP's own
+      release_package_information.json disagreed with the file name
+    - counts.source_rows and counts.source_concepts recompute from the map itself,
+      as do distinct_targets, blank_target_rows and placeholder_target_rows
+    - states sums to counts.source_concepts under exactly the four outcomes
+      direct / multi_group / conditional / no_classification. That block is a
+      RECEIPT: every concept is classified live at run time, so the receipt can
+      never make the program say something the rows do not support
+    - ledger records the rows that were EXCLUDED (international refset, inactive
+      US rows, non-FSN descriptions, inactive FSNs) so the exclusions can be
+      audited rather than taken on trust
+    - types covers every ACTIVE concept in the release, not only the mapped ones,
+      and counts.typed_concepts / counts.untyped_concepts / type_counts all
+      recompute from it. The March 2026 release types 537,775 concepts and leaves
+      6 legacy terms with no readable tag, none of which is in the map
+
+  --generated is an input, not a clock read, and the gzip member is written with a
+  fixed modification time and no stored filename, so two builds of the same inputs
+  are byte-identical no matter when or into which folder they run.
+
+  The builder fails loudly on an unexpected RF2 header, a wrong column count, a
+  non-numeric mapGroup or mapPriority, an empty mapRule, a target that is not an
+  ICD-10-CM code shape, a concept id that is not a SNOMED identifier, two rows
+  claiming the same group and priority, or a source with no active US rows at all.
+  It never fetches, scrapes, infers or repairs a clinical mapping. Before it
+  reports success it reads its own artifact back through the PROGRAM'S loader, so
+  a build the extractor would refuse at run time fails here instead.
+
+  It fails the same way on the Description file: an unexpected header, a second
+  ACTIVE fully specified name for one concept (which would make a concept's type
+  depend on file order), a conceptId that is not a SNOMED identifier, a semantic
+  tag whose shape it cannot account for, a Description file from a DIFFERENT
+  release than the map, or a concept the MAP answers for that the release does not
+  type. That last one is the important one: fail-closed eligibility would quietly
+  close that concept's diagnostic lane and no report would say the two files came
+  from different vintages.
+
+  A concept OUTSIDE the map with no readable tag only WARNS and is stored untyped.
+  Six such legacy terms exist in the March 2026 release; refusing the whole build
+  over them would cost the types of half a million concepts to protect against six,
+  and an untyped concept already fails closed.
+
+  THE TRAILING "?" IS PRESERVED, NEVER STRIPPED. 55,317 active rows of the March
+  2026 release carry a target such as T14.8XX?, where the ? stands for a 7th
+  character the map cannot supply, and every one of those rows also carries the
+  advice EPISODE OF CARE INFORMATION NEEDED. A concept with such a target is
+  reported as CONDITIONAL and is never resolved. Stripping the ? would turn an
+  admittedly incomplete code into one that looks finished, and the program would
+  then look that finished-looking code up and print a diagnostic code beside it.
+
+  THE MAP IS NOT A FLAT TABLE and the ICD-9 bridge's 60% vote is deliberately NOT
+  reused. A concept carries map GROUPS, all of which apply together, and
+  PRIORITIES within a group, of which one applies under a rule that usually needs
+  patient context. Several unconditional groups mean several ICD-10-CM codes that
+  apply TOGETHER, so each is looked up independently and the answers are kept
+  separate; voting across them would average codes meant to be used side by side.
+  Anything conditional is reported for review and never answered.
+
+  If snomed_icd10cm_reference.json.gz is put in the ship folder TOO, the
+  cross-reference section gains a third block for the SNOMED CT codes the record
+  labels as such. The same rule applies a third time:
+
+  SHIP BOTH FILES OR NEITHER. Ship the map artifact without its own manifest and
+  the SNOMED sections alone report unavailable, by design, exactly as the other
+  pairs do.
+
+  THE TWO REFERENCES ARE INDEPENDENT. Ship the map WITHOUT the DC pair and the
+  concept's type, its ICD-10-CM target and the map basis are all still reported;
+  only the diagnostic code at the end of the lane says the reference data is
+  unavailable. A missing file is named for the file it is, never for another one.
+
+  Only codes the record LABELS SNOMED or SNOMED CT, or a CDA element carrying the
+  SNOMED CT OID 2.16.840.1.113883.6.96, are ever crossed. No new detection was
+  added and no bare number is read as a SNOMED code.
+
+  A mapped ICD-10-CM target never replaces the SNOMED code in a diagnosis row and
+  never enters the final ICD-10 CODES block, for the same reason as the ICD-9 one.
+
+  A SNOMED CODE IS NOT AUTOMATICALLY A DIAGNOSIS, and this is why the Description
+  file is read at all. SNOMED codes disorders, and also findings, events,
+  situations, procedures, substances, organisms and specimens. 840546002 is
+  "Exposure to severe acute respiratory syndrome coronavirus 2 (event)": it maps
+  DIRECTLY and UNCONDITIONALLY to Z20.822, and it is still not a diagnosis of
+  COVID-19. A direct map means the terminology translation needed no patient
+  context; it never means the record confirmed a disease.
+
+  So the concept's type comes from the licensed release's own semantic tag, never
+  from the record's informal wording and never from the ICD-10-CM target, and:
+
+    - ONLY the exact tag "disorder" may reach the Potential VA Diagnostic Code
+      section. Eligibility FAILS CLOSED, so an unknown, unreadable or absent type
+      is never treated as a diagnosis by default
+    - every SNOMED code, of every type, is still reported in full in its own
+      terminology section, with its type, its ICD-10-CM target(s), the map basis,
+      the conditions and the map advice
+    - the record's own entry is never deleted or reworded. Its row keeps the
+      record's description and its code; the label on it changes, and whether it
+      is offered a diagnostic code
+    - the Claim File Handoff labels the entry for what it is - Diagnosis, Finding,
+      Procedure, Event, Situation, or Clinical entry - and OMITS the Potential VA
+      DC line entirely for a non-disorder. It is omitted rather than set to
+      "none", because "none" under a procedure still reads as though the procedure
+      had been weighed as a diagnosis and come up short
+
+  LICENSE. The US Edition of SNOMED CT is developed and maintained by the U.S.
+  National Library of Medicine and is available to authorized UMLS Metathesaurus
+  Licensees from https://uts.nlm.nih.gov. A UMLS license and a UTS account are
+  required to obtain the release; it is not redistributed with this program.
+  This material includes SNOMED Clinical Terms (SNOMED CT) which is used by
+  permission of the International Health Terminology Standards Development
+  Organisation (IHTSDO). All rights reserved. SNOMED CT was originally created by
+  the College of American Pathologists. "SNOMED" and "SNOMED CT" are registered
+  trademarks of International Health Terminology Standards Development
+  Organisation, trading as SNOMED International.
