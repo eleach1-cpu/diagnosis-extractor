@@ -34,7 +34,7 @@ Usage:
 
 import sys, os, re, json, gzip, hashlib, argparse, datetime
 
-VERSION = "3.1"
+VERSION = "3.2"
 
 SUPPORTED = (".pdf", ".docx", ".txt", ".htm", ".html", ".xml")
 

@@ -1,4 +1,4 @@
-ICD-10 Diagnosis Extractor  (version 3.1)
+ICD-10 Diagnosis Extractor  (version 3.2)
 =========================================
 
 NOT MEDICAL ADVICE. NOT LEGAL ADVICE. NO TOOL CATCHES EVERYTHING.

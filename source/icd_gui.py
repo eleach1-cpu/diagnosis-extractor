@@ -471,7 +471,7 @@ def _launch():
             log_line("ERROR: " + error, "error")
             return
         state["report"] = report
-        tail = [ln for ln in report.splitlines() if "diagnosis line(s)" in ln]
+        tail = [ln for ln in report.splitlines() if "clinical record entry line(s)" in ln]
         codes = icd_extract.codes_from_report(report)
         summary = tail[-1] if tail else "Done."
         if codes:
