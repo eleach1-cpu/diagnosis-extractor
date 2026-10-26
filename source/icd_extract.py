@@ -34,7 +34,7 @@ Usage:
 
 import sys, os, re, json, gzip, hashlib, argparse, datetime
 
-VERSION = "3.0"
+VERSION = "3.1"
 
 SUPPORTED = (".pdf", ".docx", ".txt", ".htm", ".html", ".xml")
 
@@ -47,6 +47,13 @@ CDA_OTHER_SYS = {CDA_ICD9_OID: "ICD-9-CM", CDA_SNOMED_OID: "SNOMED CT"}
 # First line of every report this tool writes. It is also how a later run recognises its own
 # output and leaves it out of the scan.
 REPORT_BANNER = "ICD-10 diagnosis codes extracted"
+# First line of every Claim File Handoff, and the format signature inside every RateMyVSO
+# export. Both are this tool's own output too, and a scan must leave them out for the same
+# reason it leaves the report out: a previous handoff read back in becomes 128 "clinical
+# entries" that cite a document this tool wrote (seen in a real supplied report, 2026-09-05).
+HANDOFF_BANNER = "CLAIM FILE HANDOFF"
+EXPORT_FORMAT = "ratemyvso.extractor-handoff"
+EXPORT_SCHEMA_VERSION = 1
 
 # The bare-code block at the foot of the report, for pasting into an outside lookup tool.
 CODES_HEADING = "ICD-10 CODES"
@@ -2363,16 +2370,40 @@ def process_file(path, codes):
     return {"error": None, "rows": rows, "meta": meta}
 
 
+def own_output_signature(head):
+    """Which of this tool's outputs a file's opening bytes belong to: "report", "handoff",
+    "export", or None for anything else. Decided by each format's explicit signature (the
+    report banner, the handoff banner, the export's format field), never by the file name, so a
+    renamed copy is still recognized and a genuine clinical text file called report.txt is
+    still scanned. Tolerates a UTF-8 BOM and either line ending."""
+    if isinstance(head, bytes):
+        text = head.decode("utf-8-sig", errors="replace")
+    else:
+        text = str(head).lstrip("\ufeff")
+    first = text.lstrip("\r\n").split("\n", 1)[0].strip()
+    if first == REPORT_BANNER:
+        return "report"
+    if first == HANDOFF_BANNER:
+        return "handoff"
+    stripped = text.lstrip()
+    if stripped.startswith("{") and re.search(
+            r'"format"\s*:\s*"' + re.escape(EXPORT_FORMAT) + '"', stripped[:2048]):
+        return "export"
+    return None
+
+
 def is_own_report(path):
-    """True if this file is a report THIS tool wrote. Scanning a folder would otherwise pick up
-    the previous run's report and read its findings back in as if they were a medical record."""
-    if os.path.splitext(path)[1].lower() not in (".txt", ".htm", ".html"):
+    """True if this file is something THIS tool wrote: the report, the Claim File Handoff, or
+    the RateMyVSO export. Scanning a folder would otherwise pick up a previous run's output and
+    read its findings back in as if they were a medical record."""
+    if os.path.splitext(path)[1].lower() not in (".txt", ".htm", ".html", ".json"):
         return False
     try:
-        with open(path, encoding="utf-8-sig", errors="replace") as f:
-            return f.readline().strip() == REPORT_BANNER
+        with open(path, "rb") as f:
+            head = f.read(4096)
     except OSError:
         return False
+    return own_output_signature(head) is not None
 
 
 def gather(target, output=None):
@@ -2972,6 +3003,162 @@ def claim_handoff_text(run=None):
                f"{len(run['files'])} file(s), organized")
     out.append("from the report named above. Nothing here is advice about what to claim.")
     return "\n".join(out) + "\n"
+
+# ---- structured export for RateMyVSO (JSON v1) --------------------------------------------
+# Contract: docs/EXTRACTOR-HANDOFF-JSON-V1-CONTRACT.md in the RateMyVSO repository. Built from the
+# SAME _handoff_entries() pass as the text handoff, so the two can never disagree about a row.
+# An explicit allowlist of primitive fields: never the internal run / file / row objects, no page
+# text, no file bytes, no drive path (the source's basename only). Writing the file transmits
+# nothing anywhere; the site reads it on the veteran's own device when they choose it.
+EXPORT_KIND_BY_LABEL = {
+    "Diagnosis": "diagnosis", "Finding/symptom": "finding", "Finding": "finding",
+    "Procedure": "procedure", "Event": "event", "Situation": "situation",
+    "Status/encounter": "status", "Test order": "test_order", "Clinical entry": "unsure",
+}
+
+
+def _export_kind(entry):
+    if entry["reason"] == HANDOFF_ORDER_REASON:
+        return "test_order"
+    if entry["reason"] in (HANDOFF_UNTYPED_REASON, HANDOFF_SNOMED_UNTYPED_REASON):
+        return "unsure"
+    return EXPORT_KIND_BY_LABEL.get(entry["label"], "unsure")
+
+
+def _export_system(entry):
+    """(the site's code system, the record's own label when it is none of the three)."""
+    if entry["sys"] == "icd10":
+        return "ICD-10-CM", None
+    csys = entry["csys"]
+    if csys.startswith("ICD-9"):
+        return "ICD-9-CM", None
+    if csys.startswith("SNOMED"):
+        return "SNOMED-CT", None
+    if entry["code"] == "-" or not csys:
+        return "other", None
+    return "other", csys[:40]
+
+
+def _export_flags(entry, kind):
+    flags = ["source_not_checked"]
+    if entry["ocr"]:
+        flags.append("ocr")
+    if entry["reason"] == HANDOFF_UNTYPED_REASON:
+        flags.append("untyped")
+    if entry["reason"] == HANDOFF_SNOMED_UNTYPED_REASON:
+        flags.append("snomed_untyped")
+    if kind == "test_order":
+        flags.append("test_order")
+    if kind == "status":
+        flags.append("status_code")
+    return flags
+
+
+def _export_locator(entry):
+    """Extracted page, printed page and line kept DISTINCT; unknown stays null."""
+    loc = str(entry["loc"] or "")
+    page = line = None
+    m = re.match(r'^p(\d+)$', loc)
+    if m:
+        page = int(m.group(1))
+    m = re.match(r'^line\s+(\d+)$', loc)
+    if m:
+        line = int(m.group(1))
+    printed = str(entry["docpage"]).split(" of ")[0].strip() if entry["docpage"] else ""
+    return {"extracted_page": page, "printed_page": printed[:20] or None, "line": line}
+
+
+def extractor_export(run=None, now=None):
+    """The RateMyVSO export (JSON v1) as a plain dict, from the LAST completed run.
+
+    ORGANIZES ONLY, like the handoff: nothing is rescanned, inferred or added. Raises ValueError
+    when no completed extraction exists.
+    """
+    run = run or LAST_RUN
+    if not run:
+        raise ValueError("No completed extraction to export - run an extraction first.")
+    entries = _handoff_entries(run)
+    basenames = {}
+    for f in run["files"]:
+        key = os.path.basename(f["path"]).lower()
+        basenames[key] = basenames.get(key, 0) + 1
+    sources, source_ids = [], {}
+    for n, f in enumerate(run["files"]):
+        base = os.path.basename(f["path"]) or str(f["path"])
+        warnings = []
+        if f["error"]:
+            warnings.append("could_not_read")
+        if basenames.get(base.lower(), 0) > 1:
+            warnings.append("name_collision")
+        try:
+            if is_own_report(f["path"]):
+                warnings.append("generated_report")
+        except Exception:
+            pass
+        sid = f"s{n + 1}"
+        source_ids[id(f)] = sid
+        if f["error"]:
+            locator_type = "file"
+        else:
+            locator_type = "page" if f["grain"] == "page" else "line"
+        sources.append({"id": sid, "alias": f"F{n + 1}", "display_name": base[:200],
+                        "locator_type": locator_type, "warnings": warnings})
+    out_entries = []
+    for i, e in enumerate(entries):
+        kind = _export_kind(e)
+        system, system_label = _export_system(e)
+        repeat = 1
+        m = re.match(r'^x(\d+)$', e["repeat"] or "")
+        if m:
+            repeat = max(1, int(m.group(1)))
+        candidates = [{"code": str(dc), "name": str(name)[:200], "basis": str(basis)[:200],
+                       "status": "mapped"}
+                      for dc, name, basis in e["facts"]["matches"]
+                      if re.match(r'^\d{4}$', str(dc))][:5]
+        status = e["facts"]["status"] or None
+        provider = None
+        if e["reviewer"] or e["reviewed"]:
+            provider = {"name": e["reviewer"][:200] if e["reviewer"] else None,
+                        "role": "reviewer",
+                        "reviewed_at": e["reviewed"][:40] if e["reviewed"] else None}
+        out_entries.append({
+            "id": f"e{i + 1}",
+            "source_id": source_ids[id(e["file"])],
+            "locator": _export_locator(e),
+            "code_system": system,
+            "code_system_label": system_label,
+            "code_raw": None if e["code"] == "-" else str(e["code"])[:40],
+            "wording": str(e["desc"])[:500],
+            "entry_kind": kind,
+            "entry_kind_label": str(e["label"])[:40],
+            "date": {"text": str(e["date"])[:40] if e["date"] else None,
+                     "approximate": bool(e["date"])},
+            "occurrence_count": repeat,
+            "ocr": bool(e["ocr"]),
+            "provider_context": provider,
+            "review_flags": _export_flags(e, kind),
+            "research_candidates": candidates,
+            "research_status": status[:200] if status else None,
+        })
+    when = now or datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "format": EXPORT_FORMAT,
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "exporter_version": VERSION,
+        "exported_at": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_count": len(sources),
+        "entry_count": len(out_entries),
+        "run": {"stopped": bool(run.get("stopped")),
+                "duplicates_collapsed": bool(run.get("unique"))},
+        "sources": sources,
+        "entries": out_entries,
+    }
+
+
+def extractor_export_json(run=None):
+    """extractor_export() as the text that goes in the file."""
+    return json.dumps(extractor_export(run), ensure_ascii=False, indent=1) + "\n"
+
 
 def _handoff_kind(entry):
     """The short TYPE / REASON cell: what the entry is, or why it needs a look."""

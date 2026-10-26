@@ -313,6 +313,7 @@ def _launch():
     open_folder_btn = ttk.Button(resultrow, text="Open folder", style="Secondary.TButton")
     handoff_btn = ttk.Button(resultrow, text="Create Claim File Handoff",
                              style="Secondary.TButton")
+    export_btn = ttk.Button(resultrow, text="Export for RateMyVSO", style="Secondary.TButton")
 
     def log_line(msg, tag=None):
         log.insert("end", msg + "\n", tag or ())
@@ -346,6 +347,7 @@ def _launch():
         open_report_btn.pack_forget()
         open_folder_btn.pack_forget()
         handoff_btn.pack_forget()
+        export_btn.pack_forget()
         footer.grid_remove()
 
     def show_results():
@@ -354,6 +356,7 @@ def _launch():
         open_report_btn.pack(side="left", padx=(8, 0))
         open_folder_btn.pack(side="left", padx=(8, 0))
         handoff_btn.pack(side="left", padx=(8, 0))
+        export_btn.pack(side="left", padx=(8, 0))
 
     def set_running(running):
         extract_btn.configure(state="disabled" if running else "normal")
@@ -405,6 +408,33 @@ def _launch():
         set_status("Claim file handoff created - not medical or legal advice; confirm every "
                    "item against the source record.", "good")
         open_path(path)
+
+    def make_export():
+        """Write the RateMyVSO export (JSON v1) beside the report, from the finished run.
+
+        Same guard as the handoff: never rescans, never presents a stale run. Nothing is sent
+        anywhere; the veteran chooses the file on the site's Import an Extractor Report screen.
+        """
+        if not state["report"] or not state["out"] or not icd_extract.LAST_RUN:
+            set_status("No completed extraction to export - run an extraction first.", "bad")
+            return
+        try:
+            text = icd_extract.extractor_export_json()
+        except ValueError as e:
+            set_status(str(e), "bad")
+            return
+        path = os.path.splitext(state["out"])[0] + "_ratemyvso.json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            set_status(f"Could not write the export: {e}", "bad")
+            return
+        log_line("")
+        log_line("RateMyVSO export saved to:", "head")
+        log_line(f"   {path}", "note")
+        set_status("Export written. Nothing was sent anywhere: choose this file on the site's "
+                   "Import an Extractor Report screen when you are ready.", "good")
 
     def copy_codes():
         codes = icd_extract.codes_from_report(state["report"] or "")
@@ -493,6 +523,7 @@ def _launch():
     clear_btn.configure(command=clear)
     copy_btn.configure(command=copy_codes)
     handoff_btn.configure(command=make_handoff)
+    export_btn.configure(command=make_export)
     open_report_btn.configure(command=lambda: open_path(state["out"]))
     open_folder_btn.configure(command=lambda: open_path(os.path.dirname(state["out"])))
     root.bind("<Return>", lambda e: start() if extract_btn["state"] != "disabled" else None)

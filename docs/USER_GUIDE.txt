@@ -1,4 +1,4 @@
-ICD-10 Diagnosis Extractor  (version 3.0)
+ICD-10 Diagnosis Extractor  (version 3.1)
 =========================================
 
 NOT MEDICAL ADVICE. NOT LEGAL ADVICE. NO TOOL CATCHES EVERYTHING.
@@ -37,9 +37,22 @@ HOW TO RUN  (Windows)
      the page it is on. Press Stop to end a long run early - what was found so
      far is kept, and the report is marked as a partial scan.
      When it finishes: "Copy ICD-10 codes", "Open report", "Open folder",
-     "Create Claim File Handoff".
+     "Create Claim File Handoff", "Export for RateMyVSO".
      "Clear" resets the window for the next job. Enter also starts a run.
      The folder you used last is remembered for next time.
+
+EXPORT FOR RATEMYVSO (optional)
+  "Export for RateMyVSO" writes  <report name>_ratemyvso.json  beside the
+  report, from the same organized result as the Claim File Handoff. On the
+  RateMyVSO site, "Import an Extractor Report" reads that file (or the
+  Claim File Handoff text) on your own computer, shows every entry with its
+  source file and page, and lets you choose which ones to save to your
+  account instead of typing them in. Nothing is sent anywhere by this
+  program; the site only sees the file when you choose it there, and it
+  never receives your medical files.
+
+  A report, handoff or export left from an earlier run is recognized by its
+  first line, whatever it is named, and is left out of the next scan.
 
 THE CLAIM FILE HANDOFF (optional)
   After a run finishes, "Create Claim File Handoff" writes a second document

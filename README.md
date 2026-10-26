@@ -43,6 +43,22 @@ itself numbers 2; a trailing `*` on a date means the nearest date on that page.
 Nothing is rescanned and nothing is added. It is not medical or legal advice, not an official VA
 mapping, not a rating prediction, and not a recommendation about what to claim.
 
+## Export for RateMyVSO (optional)
+
+**Export for RateMyVSO** writes a third file beside the report, `<report name>_ratemyvso.json`,
+from the same organized result as the Claim File Handoff. It is a plain, versioned data file
+(format `ratemyvso.extractor-handoff`, schema version 1) that the site's **Import an Extractor
+Report** screen can read on your own computer, so you can review the entries there and choose
+which ones to save to your account instead of retyping them. The export holds each retained
+entry's source file name (never the folder path), page or line, code and code system as
+written, wording as extracted, nearby date, repeat count, OCR flag, the page-header reviewer, and
+the research cross-reference kept apart from the clinical fields. It never holds page text or
+your files. Writing it sends nothing anywhere; the site only sees the file when you choose it.
+
+A previous run's report, Claim File Handoff or export left in the scanned folder is recognized by
+its first line or format signature (whatever it is named) and left out of the next scan, so an
+old handoff is never read back in as if it were a medical record.
+
 ## Potential VA Diagnostic Code (optional)
 
 If `dc_reference.json` sits beside the program, the report gains one extra section listing, for
